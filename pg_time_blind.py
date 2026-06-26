@@ -111,6 +111,8 @@ class Oracle:
         headers = {k: self._put(v, payload) for k, v in self.headers.items()}
         # let requests set its own Content-Length / Host
         headers.pop("Content-Length", None)
+        if data and not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         for attempt in range(self.a.retries + 1):
             self.count += 1
             t = time.time()
