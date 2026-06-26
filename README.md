@@ -50,7 +50,7 @@ pip install -r requirements.txt
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/pg-time-blind.git
+git clone https://github.com/SirReddington/pg-time-blind.git
 cd pg-time-blind
 pip install -r requirements.txt
 python3 pg_time_blind.py --help
