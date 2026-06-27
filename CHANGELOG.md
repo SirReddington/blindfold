@@ -2,6 +2,8 @@
 
 ## v3.0 — Multi-DBMS + automatic technique selection
 
+> Renamed: `pg-time-blind` → **blindfold** (script `pg_time_blind.py` → `blindfold.py`).
+
 ### Added
 - **Automatic DBMS detection** (fingerprinting) for **PostgreSQL, MySQL, MSSQL, Oracle**;
   pin manually with `--dbms`.
