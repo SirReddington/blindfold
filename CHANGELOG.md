@@ -1,23 +1,30 @@
 # Changelog
 
-## v2.0 — Structured detection (boolean + time-based)
+## v3.0 — Multi-DBMS + automatic technique selection
 
 ### Added
-- **Two-phase workflow.** Phase 1 detects the injection; Phase 2 extracts.
-- **Automatic blind-type detection.** Tries **boolean-based** first (no waiting, much
-  faster) and falls back to **time-based** (`pg_sleep`) only when boolean gives no signal.
-- **Auto-calibration of the TRUE/FALSE signal** for boolean blind: diffs **status code →
-  body length → a unique body token** to pick a reliable discriminator.
-- **Automatic context discovery** across `stacked`, `string-and`, `string-or`,
-  `numeric-and`, `numeric-or` — no need to guess `--preset` anymore.
-- New flags: `--context`, `--force-boolean`, `--force-time`, `--true-match`,
-  `--false-match`, `--len-margin`, `--len-jitter`.
+- **Automatic DBMS detection** (fingerprinting) for **PostgreSQL, MySQL, MSSQL, Oracle**;
+  pin manually with `--dbms`.
+- **Error-based extraction** — forces a reflected DB error and dumps the value in a single
+  request (PostgreSQL `CAST`, MySQL `extractvalue` with automatic chunking, MSSQL `CAST/convert`).
+  Tried first because it's the fastest path; `--no-error` to skip.
+- **Technique auto-selection**: error-based → boolean-based → time-based.
+- **Safe mode (default)**: risky `OR` contexts that can change app state are skipped unless
+  `--allow-or` is given.
+- **Threaded boolean extraction** via `--threads N` (time-based stays serial for clean timing).
+- **Robust calibration**: 3 samples per side and digit-stripped token matching to survive
+  dynamic content (CSRF tokens, timestamps).
+- Resume checkpoint now also caches the detected DBMS/technique/context.
 
 ### Changed
-- Replaced the old `--preset` selection with detected/pinned `--context`.
-- Resume checkpoint signature now includes the detected type + context.
-- Output reorganised into clear `PHASE 1` / `PHASE 2` sections.
+- Detection reorganised into explicit **DBMS / TECHNIQUE / CONTEXT** reporting.
+- Per-character primitives are now DBMS-aware (`substr` vs `substring`, `length` vs `len`).
 
 ### Notes
-- Existing time-based commands keep working; they now simply report the detected
-  type and context. The script filename and import name are unchanged.
+- Oracle uses boolean extraction (inline time/error primitives omitted for reliability).
+- Existing PostgreSQL commands keep working; output now reports the detected backend + technique.
+
+## v2.0 — Structured detection (boolean + time-based)
+
+- Two-phase workflow: detect injection (boolean preferred, time fallback) then extract.
+- Auto-calibrated TRUE/FALSE signal; automatic context discovery; resume support.

