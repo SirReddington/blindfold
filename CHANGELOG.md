@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.2.1 — Review pass: cleanup + small efficiency wins
+
+### Changed
+- **`--query` now uses the binary length probe** (`_bin_length`) instead of the old linear
+  `1..maxlen` scan — ~7 requests instead of ~64, and no silent truncation of long results.
+- **`--maxlen` repurposed** as the binary length cap (default raised `64 → 4096`); removed the
+  hard-coded internal cap.
+- **Removed dead `--cmin` / `--cmax`** flags (the Unicode-aware extractor no longer uses them;
+  also dropped from the resume signature).
+- **`char()` raises the search floor to 128** once a byte is known to be non-ASCII (saves ~1
+  request per non-ASCII char).
+- **Threaded extraction uses `submit` + `as_completed`** with per-position retry, so one bad
+  worker can't abort the whole batch.
+- Removed leftover dead `thresh` in `find_time`; renamed resume file to `.blindfold-<id>.json`.
+
+### Added
+- **`--ascii`**: skip the Unicode probe on ASCII-only targets (1 fewer request/char).
+
 ## v3.2 — Reliability hardening
 
 ### Added

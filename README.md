@@ -155,9 +155,9 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--cal-samples`  | `5` | Baseline latency samples for the adaptive threshold |
 | `--retries`      | `1` | Re-confirm each time-based positive N times (beats jitter) |
 | `--threads`      | `1` | Parallel workers for **boolean** extraction (each char is verified) |
-| `--maxlen`       | `64` | Max value length to probe |
+| `--maxlen`       | `4096` | Max value length / binary length-probe cap |
+| `--ascii`        | off | ASCII-only target: skip the Unicode probe (1 fewer request/char) |
 | `--max-codepoint`| `0x10FFFF` | Upper bound for Unicode (non-ASCII) character extraction |
-| `--cmin/--cmax`  | `32/126` | Legacy ASCII bounds (extraction now auto-ranges over Unicode) |
 | `--proxy`        | – | e.g. `http://127.0.0.1:8080` to view in Burp |
 
 ### Resume
