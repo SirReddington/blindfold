@@ -562,10 +562,16 @@ def _norm_tokens(text):
     return {w for w in re.sub(r"\d+", "#", text).split() if len(w) >= 3}
 
 def calibrate(target, ctx, a, cond_true=TRUE_COND, cond_false=FALSE_COND):
-    if a.true_match:
-        return (lambda r: a.true_match in r.text), f"text~'{a.true_match}'"
-    if a.false_match:
-        return (lambda r: a.false_match not in r.text), f"!text~'{a.false_match}'"
+    # user-supplied matcher: still VERIFY it actually distinguishes true vs false in
+    # THIS context (otherwise we'd "detect" an injection that isn't really there).
+    if a.true_match or a.false_match:
+        if a.true_match:
+            clf, desc = (lambda r: a.true_match in r.text), f"text~'{a.true_match}'"
+        else:
+            clf, desc = (lambda r: a.false_match not in r.text), f"!text~'{a.false_match}'"
+        rt = target.send(boolean_payload(ctx, cond_true, "-- -"))
+        rf = target.send(boolean_payload(ctx, cond_false, "-- -"))
+        return (clf, desc) if (clf(rt) and not clf(rf)) else None
     T = [target.send(boolean_payload(ctx, cond_true, "-- -")) for _ in range(3)]
     F = [target.send(boolean_payload(ctx, cond_false, "-- -")) for _ in range(3)]
     # 1) status code
