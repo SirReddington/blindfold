@@ -410,6 +410,16 @@ class Target:
         self.verify = not getattr(a, "insecure", False)
         if not self.verify:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        # sanitize replayed headers: force plaintext responses (so matching works) and
+        # drop hop-by-hop headers that make some servers 400 a replayed browser request
+        _drop = {"accept-encoding", "connection", "te", "content-length"}
+        self.headers = {k: v for k, v in self.headers.items() if k.lower() not in _drop}
+        self.headers["Accept-Encoding"] = "identity"
+        # the injection marker must actually appear somewhere we can substitute into
+        blob = (self.url or "") + (self.data or "") + "".join(self.headers.values())
+        if a.marker not in blob:
+            raise SystemExit(f"[!] marker {a.marker!r} not found in the request — place it at the "
+                             f"injection point (e.g. TrackingId=abc{a.marker} in the cookie).")
         self.session = requests.Session()    # keep-alive + cookie persistence
         self._baseline = None
         names = [t.strip() for t in (getattr(a, "tamper", None) or "").split(",") if t.strip()]

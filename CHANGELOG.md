@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.5.2 — request hygiene: marker check + header sanitization
+
+### Fixed
+- **Errors loudly if the injection marker is missing** from the URL/body/headers (a saved
+  request with no marker used to be replayed unchanged, producing a confusing "no signal").
+- **Replayed requests are sanitized**: `Accept-Encoding` is forced to `identity` (Brotli/gzip
+  bodies broke length/content matching) and hop-by-hop headers (`Connection`, `TE`,
+  `Content-Length`) are dropped — these caused some servers to return HTTP 400 on a replayed
+  browser request, which looked like a detection failure but wasn't.
+
 ## v3.5.1 — stronger boolean calibration + verbose diagnostics
 
 ### Added
