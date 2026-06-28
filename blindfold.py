@@ -70,6 +70,16 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
+VERSION = "3.5.0"
+BANNER = r"""
+  _     _ _           _  __       _     _
+ | |__ | (_)_ __   __| |/ _| ___ | | __| |
+ | '_ \| | | '_ \ / _` | |_ / _ \| |/ _` |
+ | |_) | | | | | | (_| |  _| (_) | | (_| |
+ |_.__/|_|_|_| |_|\__,_|_|  \___/|_|\__,_|   v%s
+        blind SQLi framework  -  created by Hassan Almatar
+""" % VERSION
+
 
 class RequestError(Exception):
     """An HTTP request ultimately failed (after transport retries). Catchable so
@@ -1109,6 +1119,7 @@ def main():
 
     target = Target(a)
 
+    print(BANNER)
     print("=== PHASE 1: detection ===")
     det = detect(target, a)
     if not det:
