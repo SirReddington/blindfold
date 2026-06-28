@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.3.0 — `--rce` (command exec) and `--webshell` (file drop)
+
+Two distinct, DBMS-aware RCE actions. Both run after auto-detection (DBMS + technique +
+context) and skip data extraction. **Authorized testing only.**
+
+### Added
+- **`--rce [CMD]`** — direct OS command execution; output read back through the detected oracle.
+  Bare `--rce` opens an interactive pseudo-shell; `--rce "cmd"` runs once.
+  - **PostgreSQL**: `COPY ... FROM PROGRAM` (superuser).
+  - **MSSQL**: enables + runs `xp_cmdshell` (sysadmin).
+  - MySQL/Oracle: no direct exec → points you to `--webshell`.
+- **`--webshell`** — drops a webshell file, **verifies the write through the oracle**
+  (`LOAD_FILE` / `pg_read_file`), and prints the confirmed path. No blind guessing.
+  - **MySQL**: `INTO DUMPFILE` with a hex-encoded payload (raw, survives quotes/specials).
+  - **PostgreSQL**: `COPY (...) TO`.
+  - When `--os-path` is omitted, it tries common web roots; for MySQL it also tries
+    `../`-traversal candidates relative to the datadir, verifying each.
+- **`--os-path`** (target file or web-root dir), `--shell-name`, `--shell-payload`.
+
+> Needs high DB privileges (superuser / sysadmin / `FILE` + permissive `secure_file_priv`).
+> Command exec requires stacked-query support; the webshell **verify** step works over any
+> detected blind channel (boolean / error / time).
+
 ## v3.2.1 — Review pass: cleanup + small efficiency wins
 
 ### Changed

