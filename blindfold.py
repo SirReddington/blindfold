@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 BANNER = r"""
   _     _ _           _  __       _     _
  | |__ | (_)_ __   __| |/ _| ___ | | __| |
@@ -447,6 +447,10 @@ class Target:
         return s.replace(self.a.marker, payload) if s else s
 
     def send(self, payload):
+        d = getattr(self.a, "delay", 0.0)          # pace requests (avoid rate-limit / 504 tar-pit)
+        if d:
+            j = getattr(self.a, "jitter", 0.0)
+            time.sleep(d + (random.random() * j if j else 0.0))
         payload = self._transform(payload)
         url = self._put(self.url, payload)
         data = self._put(self.data, payload)
@@ -1145,6 +1149,8 @@ def main():
     tun.add_argument("--proxy")
     tun.add_argument("--insecure", action="store_true", help="skip TLS verification (and silence its warning)")
     tun.add_argument("-v", "--verbose", action="store_true", help="show detection internals (probe status/length, discriminator)")
+    tun.add_argument("--delay", type=float, default=0.0, help="seconds to wait before each request (evade rate limits / 504)")
+    tun.add_argument("--jitter", type=float, default=0.0, help="add random 0..N seconds on top of --delay")
 
     res = ap.add_argument_group("resume")
     res.add_argument("--state"); res.add_argument("--fresh", action="store_true")
